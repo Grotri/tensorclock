@@ -1,2 +1,1 @@
-# tensorclock
-Dynamic AI ASIC overclocking layer
+There's nothing to see ATM. Waiting for Ideathon results...
