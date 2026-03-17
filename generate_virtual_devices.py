@@ -17,12 +17,12 @@ def generate_hidden_parameters(base_thermal_resistance: float) -> dict:
     Generate a random hidden-parameters set for a virtual device.
 
     - silicon_quality: uniform in [0.92, 1.08]
-    - degradation: uniform in [0.0, 0.2]
+    - degradation: uniform in [0.0, 0.05] (up to 5%)
     - thermal_resistance: seed value; actual value will be randomized
       in generate_device via apply_thermal_resistance_spread=True.
     """
     silicon_quality = random.uniform(0.92, 1.08)
-    degradation = random.uniform(0.0, 0.2)
+    degradation = random.uniform(0.0, 0.05)
 
     return {
         "silicon_quality": silicon_quality,

@@ -157,7 +157,7 @@ def test_ambient_temperature_levels(simulator: ASICPhysicsSimulator):
     # Test parameters
     params = OptimizationParameters(
         frequency=600.0,
-        voltage=13.2,
+        voltage=13,
         fan_speed=100.0
     )
     
@@ -192,7 +192,7 @@ def test_critical_temperature_warning(simulator: ASICPhysicsSimulator):
         ("High Freq, Low Fan", 650.0, 14.0, 30.0),
         ("Max Freq, Min Fan", 650.0, 14.5, 0.0),
         ("High Freq, Normal Fan", 640.0, 13.8, 100.0),
-        ("Normal Freq, Low Fan", 600.0, 13.2, 20.0),
+        ("Normal Freq, Low Fan", 600.0, 13.0, 20.0),
     ]
     
     print("-" * 100)
@@ -302,10 +302,10 @@ def test_power_limits(simulator: ASICPhysicsSimulator):
     print(f"\nDevice power limits: [{limits.min_power:.0f}, {limits.max_power:.0f}] W (nominal: {nominal:.0f} W)")
     
     # Normal case: parameters that should yield power within limits
-    params_normal = OptimizationParameters(frequency=600.0, voltage=13.2, fan_speed=100.0)
+    params_normal = OptimizationParameters(frequency=600.0, voltage=13.0, fan_speed=100.0)
     outcome_normal = simulator.simulate(AmbientTemperatureLevel.LEVEL_3, params_normal)
     
-    print(f"\nNormal params (Freq=600 MHz, V=13.2 V):")
+    print(f"\nNormal params (Freq=600 MHz, V=13.0 V):")
     print(f"  Power: {outcome_normal.power:.1f} W, Valid: {outcome_normal.valid}")
     assert (not outcome_normal.valid) or (limits.min_power <= outcome_normal.power <= limits.max_power), \
         "Valid outcome must have power within limits"
@@ -465,7 +465,7 @@ def main():
     print_section("Loading Virtual Device")
 
     # Try to load an existing device (use JSON format to avoid pickle serialization issues)
-    device_path = Path("virtual_devices/antminer_s19_22dc2e97.json")
+    device_path = Path("virtual_devices/antminer_s19_01a5fa6c.json")
 
     try:
         # Extract device_id from filename (remove extension and directory)

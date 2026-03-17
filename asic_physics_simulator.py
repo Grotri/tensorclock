@@ -597,15 +597,4 @@ class ASICPhysicsSimulator:
         # Apply degradation
         hashrate *= (1 - hidden.degradation)
 
-        # Temperature penalty (efficiency drops at high temperature)
-        temp_penalty = 1.0
-        if temperature > 70:
-            temp_penalty = 1.0 - 0.01 * (temperature - 70)
-        hashrate *= max(0.5, temp_penalty)
-
-        # Voltage efficiency
-        voltage_efficiency = params.voltage / spec.optimal_voltage
-        voltage_efficiency = min(1.0, voltage_efficiency)
-        hashrate *= voltage_efficiency
-
         return hashrate
