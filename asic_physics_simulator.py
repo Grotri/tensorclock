@@ -131,9 +131,15 @@ class ASICPhysicsSimulator:
         }
         
         # Noise parameters for system instability
-        self._noise_magnitude = 0.0001  # 2% voltage noise
+        self._noise_magnitude = 0.0001   # 2% voltage noise (std of normal)
         self._noise_frequency = 0.01   # Probability of noise spike
-        
+
+        # F/V curve: voltage (Y) scaling coefficients
+        # Below nominal frequency: voltage multiplier
+        self._fv_coef_below = 0.4
+        # Above nominal frequency: voltage multiplier
+        self._fv_coef_above = 2.5
+
     def load_device(self, device_id: str, device_path: Optional[str] = None) -> None:
         """
         Load a virtual device into the simulator.
@@ -194,15 +200,14 @@ class ASICPhysicsSimulator:
         """
         Calculate base voltage for a given frequency using quadratic relationship.
         
-        The relationship is roughly quadratic: V ∝ f²
-        Silicon lottery multiplier affects the base voltage requirement.
-        
-        Lower frequencies (below manufacturer frequency) keep voltage around 0.95 of base voltage.
-        Higher frequencies (above manufacturer frequency) show quadratic voltage growth.
+        At manufacturer_frequency the result is exactly optimal_voltage (e.g. 13 V at 600 MHz).
+        Below nominal: _fv_coef_below softens the voltage drop (smaller coef = less sharp drop).
+        Above nominal: _fv_coef_above sharpens the quadratic rise (larger coef = steeper growth).
+        Silicon_quality is used by undervolting logic; the base curve is nominal.
         
         Args:
             frequency: Frequency in MHz
-            silicon_quality: Silicon quality multiplier (0.92 - 1.08)
+            silicon_quality: Silicon quality multiplier (0.92 - 1.08), for compatibility
             
         Returns:
             Required voltage in Volts
@@ -210,34 +215,20 @@ class ASICPhysicsSimulator:
         if not self.device:
             raise ValueError("No device loaded")
         
-        # Base frequency and voltage from device specification
         base_freq = self.device.base_specification.manufacturer_frequency  # MHz
-        base_voltage = self.device.base_specification.optimal_voltage  # Volts
+        base_voltage = self.device.base_specification.optimal_voltage  # Volts (e.g. 13 V at 600 MHz)
         
-        # Silicon lottery: better quality needs less voltage
-        # silicon_quality > 1.0 means better silicon, needs less voltage
-        silicon_multiplier = 1.0 / silicon_quality
+        freq_ratio = float(frequency) / base_freq
         
-        # Calculate frequency ratio relative to base frequency
-        freq_ratio = frequency / base_freq
-        
-        # Piecewise quadratic relationship:
-        # - For frequencies below manufacturer frequency: voltage stays around 0.95 of base
-        # - For frequencies above manufacturer frequency: voltage increases quadratically
         if freq_ratio < 1.0:
-            # Lower frequencies: keep voltage around 0.95 of base (undervolting benefit)
-            # Slight linear reduction as frequency decreases
-            voltage = base_voltage * (0.95 + 0.05 * freq_ratio)
+            # Softer drop when coef_below < 1: slope scaled so (600 MHz, 13 V) stays fixed
+            voltage = base_voltage * (1.0 + 0.05 * self._fv_coef_below * (freq_ratio - 1.0))
         else:
-            # Higher frequencies: quadratic growth
-            # V = V_base * (1 + 0.5 * (f_ratio - 1)²)
-            quadratic_factor = 1.0 + 0.5 * ((freq_ratio - 1.0) ** 2)
+            # Steeper rise when coef_above > 1: quadratic term scaled, (600 MHz, 13 V) stays fixed
+            quadratic_factor = 1.0 + (0.5 * self._fv_coef_above) * ((freq_ratio - 1.0) ** 2)
             voltage = base_voltage * quadratic_factor
         
-        # Apply silicon lottery multiplier
-        voltage = voltage * silicon_multiplier
-        
-        return voltage
+        return float(voltage)
     
     def apply_undervolting(
         self,
@@ -266,10 +257,10 @@ class ASICPhysicsSimulator:
         # silicon_quality > 1.0 = better silicon = more undervolting possible
         # silicon_quality < 1.0 = worse silicon = less undervolting possible
         
-        # Base undervolting range: 7-10%
-        # Map silicon_quality (0.92 - 1.08) to undervolting (7% - 10%)
+        # Base undervolting range 7–10%, scaled by silicon_quality², then reduced by 1/3
         quality_normalized = (silicon_quality - 0.92) / (1.08 - 0.92)  # 0.0 to 1.0
-        undervolt_percentage = 0.07 + 0.03 * quality_normalized  # 7% to 10%
+        base_pct = 0.07 + 0.03 * quality_normalized
+        undervolt_percentage = min(0.15, base_pct * (silicon_quality ** 2)) * (2.0 / 3.0)
         
         # Apply undervolting
         undervolted_voltage = voltage * (1.0 - undervolt_percentage)
@@ -322,7 +313,10 @@ class ASICPhysicsSimulator:
             spike = 0.0
         
         # Frequency-dependent noise (higher frequency = more instability)
-        freq_factor = frequency / 600.0  # normalized to nominal frequency
+        nominal_freq = getattr(
+            self.device.base_specification, 'manufacturer_frequency', 600.0
+        ) if self.device else 600.0
+        freq_factor = float(frequency) / nominal_freq
         freq_noise = rng.normal(0, 0.005 * voltage * freq_factor)
         
         # Combine all noise sources
@@ -356,35 +350,44 @@ class ASICPhysicsSimulator:
         
         hidden = self.device.hidden_parameters
         limits = self.device.base_specification.hardware_limits
-        
+        max_freq = limits.max_frequency
+
+        # Undervolting: base 7–10% × silicon_quality², reduced by 1/3 (same as apply_undervolting)
+        quality_normalized = (hidden.silicon_quality - 0.92) / (1.08 - 0.92)
+        base_pct = 0.07 + 0.03 * quality_normalized
+        undervolt_percentage = min(0.15, base_pct * (hidden.silicon_quality ** 2)) * (2.0 / 3.0)
+
         # Generate frequency points
         frequencies = np.linspace(limits.min_frequency, limits.max_frequency, num_points)
         curve = []
-        
+
         for i, freq in enumerate(frequencies):
+            freq_scalar = float(freq)
             point_seed = seed + i if seed is not None else None
-            
-            # Calculate base voltage
-            voltage = self.calculate_base_voltage(freq, hidden.silicon_quality)
-            
-            # Apply undervolting if requested
-            is_stable = True
+
+            # Base voltage from frequency (same formula for both with/without undervolting)
+            base_voltage = self.calculate_base_voltage(freq_scalar, hidden.silicon_quality)
+
             if apply_undervolting_opt:
-                voltage, is_stable = self.apply_undervolting(voltage, hidden.silicon_quality, freq)
-            
-            # Add noise if requested
+                voltage = base_voltage * (1.0 - undervolt_percentage)
+                freq_ratio = freq_scalar / max_freq
+                stability_threshold = 0.95 - 0.1 * freq_ratio
+                is_stable = undervolt_percentage < stability_threshold
+            else:
+                voltage = base_voltage
+                is_stable = True
+
             if add_noise:
-                voltage = self.add_voltage_noise(voltage, freq, point_seed)
-            
-            # Clamp to hardware limits
-            voltage = np.clip(voltage, limits.min_voltage, limits.max_voltage)
-            
+                voltage = self.add_voltage_noise(voltage, freq_scalar, point_seed)
+
+            voltage = float(np.clip(voltage, limits.min_voltage, limits.max_voltage))
+
             curve.append(FrequencyVoltagePoint(
-                frequency=freq,
+                frequency=freq_scalar,
                 voltage=voltage,
                 is_stable=is_stable
             ))
-        
+
         return curve
     
     def plot_frequency_voltage_curve(
@@ -493,6 +496,18 @@ class ASICPhysicsSimulator:
         # Calculate power consumption
         power = self._calculate_power(params, temperature, hidden, spec)
         
+        # Enforce power limits (min_power, max_power)
+        if power < limits.min_power or power > limits.max_power:
+            return SimulationOutcome(
+                temperature=temperature,
+                power=power,
+                hashrate=0,
+                efficiency=float('inf'),
+                valid=False,
+                warning=(f"Power {power:.1f} W outside limits "
+                         f"[{limits.min_power:.0f}, {limits.max_power:.0f}]")
+            )
+        
         # Calculate hashrate
         hashrate = self._calculate_hashrate(params, temperature, hidden, spec)
         
@@ -522,22 +537,10 @@ class ASICPhysicsSimulator:
         Temperature Model:
         T = T_ambient + (P × R_thermal) / (1 + 0.5 × fan_speed/100)
         """
-        # Get nominal frequency from device specification
-        nominal_freq = getattr(spec, 'manufacturer_frequency', 600.0)
-
-        # Calculate nominal current from device specification
-        nominal_current = spec.nominal_power / spec.optimal_voltage
-
-        # Scale current with voltage and frequency
-        current = nominal_current * (params.voltage / spec.optimal_voltage)
-        freq_ratio = params.frequency / nominal_freq
-
-        # Base power: P = V × I × (f / f_nominal)
-        # Power scales linearly with frequency, not by multiplying by MHz
-        base_power = params.voltage * current * freq_ratio
-
-        # Apply silicon quality and degradation
-        effective_power = base_power * hidden.silicon_quality * (1 + hidden.degradation)
+        # Chip power (internal dissipation) from dynamic power model:
+        # P_chip = C * V^2 * frequency
+        p_chip = spec.C * (params.voltage ** 2) * params.frequency
+        effective_power = p_chip
 
         # Calculate temperature rise using device-specific thermal resistance
         temp_rise = effective_power * hidden.thermal_resistance
@@ -564,27 +567,12 @@ class ASICPhysicsSimulator:
         Calculate power consumption.
 
         Power Model:
-        P = V × I × (f / f_nominal)
+        P_wall = P_chip / efficiency
+        P_chip = C * V^2 * frequency
         """
-        # Get nominal frequency from device specification
-        nominal_freq = getattr(spec, 'manufacturer_frequency', 600.0)
-
-        # Base power (using nominal current scaled by voltage)
-        nominal_current = spec.nominal_power / spec.optimal_voltage
-        current = nominal_current * (params.voltage / spec.optimal_voltage)
-        freq_ratio = params.frequency / nominal_freq
-
-        # Base power: P = V × I × (f / f_nominal)
-        # Power scales linearly with frequency ratio, not by multiplying by MHz
-        base_power = params.voltage * current * freq_ratio
-
-        # Temperature effect (power increases with temperature)
-        # temp_factor = 1 + 0.001 * (temperature - 25)
-
-        # Apply device-specific factors
-        power = base_power
-
-        return power
+        p_chip = spec.C * (params.voltage ** 2) * params.frequency
+        power_wall = p_chip / spec.efficiency
+        return float(power_wall)
     
     def _calculate_hashrate(
         self,
@@ -598,126 +586,26 @@ class ASICPhysicsSimulator:
         
         Hashrate Model:
         HR = f × HR_per_mhz × silicon_quality × (1 - degradation) × 
-             frequency_response × temp_penalty × voltage_efficiency
+            temp_penalty × voltage_efficiency
         """
         # Base hashrate from frequency
         base_hashrate = params.frequency * spec.hashrate_per_mhz
-        
+
         # Apply silicon quality
         hashrate = base_hashrate * hidden.silicon_quality
-        
+
         # Apply degradation
         hashrate *= (1 - hidden.degradation)
-        
-        # Apply frequency response
-        hashrate *= hidden.frequency_response
-        
+
         # Temperature penalty (efficiency drops at high temperature)
         temp_penalty = 1.0
         if temperature > 70:
             temp_penalty = 1.0 - 0.01 * (temperature - 70)
         hashrate *= max(0.5, temp_penalty)
-        
+
         # Voltage efficiency
         voltage_efficiency = params.voltage / spec.optimal_voltage
         voltage_efficiency = min(1.0, voltage_efficiency)
         hashrate *= voltage_efficiency
-        
+
         return hashrate
-    
-    def run_parameter_sweep(
-        self,
-        ambient_level: AmbientTemperatureLevel,
-        frequency_range: Tuple[float, float],
-        voltage_range: Tuple[float, float],
-        fan_speed: float = 100.0,
-        num_points: int = 20
-    ) -> List[Tuple[OptimizationParameters, SimulationOutcome]]:
-        """
-        Run a parameter sweep across frequency and voltage ranges.
-        
-        Args:
-            ambient_level: Ambient temperature level
-            frequency_range: (min_freq, max_freq) in MHz
-            voltage_range: (min_voltage, max_voltage) in Volts
-            fan_speed: Fan speed percentage
-            num_points: Number of points per dimension
-            
-        Returns:
-            List of (parameters, outcome) tuples
-        """
-        results = []
-        
-        frequencies = np.linspace(frequency_range[0], frequency_range[1], num_points)
-        voltages = np.linspace(voltage_range[0], voltage_range[1], num_points)
-        
-        for freq in frequencies:
-            for volt in voltages:
-                params = OptimizationParameters(
-                    frequency=freq,
-                    voltage=volt,
-                    fan_speed=fan_speed
-                )
-                
-                outcome = self.simulate(ambient_level, params)
-                results.append((params, outcome))
-        
-        return results
-    
-    def find_optimal_parameters(
-        self,
-        ambient_level: AmbientTemperatureLevel,
-        target: str = 'efficiency',
-        frequency_range: Optional[Tuple[float, float]] = None,
-        voltage_range: Optional[Tuple[float, float]] = None
-    ) -> Tuple[OptimizationParameters, SimulationOutcome]:
-        """
-        Find optimal parameters for a given target.
-        
-        Args:
-            ambient_level: Ambient temperature level
-            target: Optimization target ('efficiency', 'hashrate', 'balanced')
-            frequency_range: Optional frequency range to search
-            voltage_range: Optional voltage range to search
-            
-        Returns:
-            Tuple of (optimal_parameters, optimal_outcome)
-        """
-        if not self.device:
-            raise ValueError("No device loaded")
-        
-        limits = self.device.base_specification.hardware_limits
-        
-        # Use hardware limits if ranges not provided
-        if frequency_range is None:
-            frequency_range = (limits.min_frequency, limits.max_frequency)
-        if voltage_range is None:
-            voltage_range = (limits.min_voltage, limits.max_voltage)
-        
-        # Run parameter sweep
-        results = self.run_parameter_sweep(
-            ambient_level=ambient_level,
-            frequency_range=frequency_range,
-            voltage_range=voltage_range,
-            num_points=30
-        )
-        
-        # Filter valid results
-        valid_results = [(p, o) for p, o in results if o.valid]
-        
-        if not valid_results:
-            # Return first result if all invalid
-            return results[0]
-        
-        # Find optimal based on target
-        if target == 'efficiency':
-            optimal = min(valid_results, key=lambda x: x[1].efficiency)
-        elif target == 'hashrate':
-            optimal = max(valid_results, key=lambda x: x[1].hashrate)
-        elif target == 'balanced':
-            # Balance efficiency and hashrate
-            optimal = max(valid_results, key=lambda x: x[1].hashrate / x[1].efficiency)
-        else:
-            raise ValueError(f"Unknown target: {target}")
-        
-        return optimal

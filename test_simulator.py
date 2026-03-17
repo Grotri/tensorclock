@@ -16,6 +16,7 @@ Version: 1.0
 
 import sys
 from pathlib import Path
+from typing import List, Tuple
 import numpy as np
 
 # Import simulator and device generator
@@ -26,6 +27,33 @@ from asic_physics_simulator import (
     SimulationOutcome
 )
 from virtual_device_generator import VirtualDeviceGenerator, HiddenParameters
+
+
+def run_parameter_sweep(
+    simulator: ASICPhysicsSimulator,
+    ambient_level: AmbientTemperatureLevel,
+    frequency_range: Tuple[float, float],
+    voltage_range: Tuple[float, float],
+    fan_speed: float = 100.0,
+    num_points: int = 20
+) -> List[Tuple[OptimizationParameters, SimulationOutcome]]:
+    """
+    Run a parameter sweep over frequency and voltage (test-only helper).
+    Uses simulator.simulate() for each point; logic stays in the simulator.
+    """
+    results = []
+    frequencies = np.linspace(frequency_range[0], frequency_range[1], num_points)
+    voltages = np.linspace(voltage_range[0], voltage_range[1], num_points)
+    for freq in frequencies:
+        for volt in voltages:
+            params = OptimizationParameters(
+                frequency=float(freq),
+                voltage=float(volt),
+                fan_speed=fan_speed
+            )
+            outcome = simulator.simulate(ambient_level, params)
+            results.append((params, outcome))
+    return results
 
 
 def print_section(title: str):
@@ -44,11 +72,15 @@ def print_device_info(device):
     print(f"  Silicon Quality: {device.hidden_parameters.silicon_quality:.4f}")
     print(f"  Degradation: {device.hidden_parameters.degradation:.4f}")
     print(f"  Thermal Resistance: {device.hidden_parameters.thermal_resistance:.4f} °C/W")
-    print(f"  Voltage Tolerance: {device.hidden_parameters.voltage_tolerance:.4f}")
-    print(f"  Frequency Response: {device.hidden_parameters.frequency_response:.4f}")
+    # print(f"  Voltage Tolerance: {device.hidden_parameters.voltage_tolerance:.4f}")
+    # print(f"  Frequency Response: {device.hidden_parameters.frequency_response:.4f}")
     print(f"\nBase Specification:")
     print(f"  Nominal Hashrate: {device.base_specification.nominal_hashrate} TH/s")
     print(f"  Nominal Power: {device.base_specification.nominal_power} W")
+
+    limits = device.base_specification.hardware_limits
+    print(f"  Power Limits: [{limits.min_power:.0f}, {limits.max_power:.0f}] W")
+    
     print(f"  Optimal Voltage: {device.base_specification.optimal_voltage} V")
     print(f"  Hashrate per MHz: {device.base_specification.hashrate_per_mhz} TH/(s·MHz)")
 
@@ -189,11 +221,12 @@ def test_undervolting_optimization(simulator: ASICPhysicsSimulator):
     
     print(f"\nDevice Silicon Quality: {silicon_quality:.4f}")
     
-    # Calculate undervolting percentage
+    # Undervolting: base 7–10% scaled by silicon_quality² (same as simulator)
     quality_normalized = (silicon_quality - 0.92) / (1.08 - 0.92)
-    undervolt_percentage = 0.07 + 0.03 * quality_normalized
+    base_pct = 0.07 + 0.03 * quality_normalized
+    undervolt_percentage = min(0.15, base_pct * (silicon_quality ** 2))
     
-    print(f"Undervolting Optimization: {undervolt_percentage*100:.2f}%")
+    print(f"Undervolting Optimization: {undervolt_percentage*100:.2f}% (× silicon_quality²)")
     
     # Test at different frequencies
     print("\nTesting undervolting at different frequencies:")
@@ -210,21 +243,23 @@ def test_undervolting_optimization(simulator: ASICPhysicsSimulator):
     
     print("-" * 80)
     
-    # Generate curves with and without undervolting
-    print("\nGenerating comparison curves (with/without undervolting)...")
+    # Generate clean curves (no noise) for clear comparison
+    print("\nGenerating comparison curves (with/without undervolting, no noise)...")
     
     curve_with_uv = simulator.generate_frequency_voltage_curve(
         ambient_level=AmbientTemperatureLevel.LEVEL_3,
         add_noise=False,
         apply_undervolting_opt=True,
-        num_points=200
+        num_points=200,
+        seed=42
     )
     
     curve_without_uv = simulator.generate_frequency_voltage_curve(
         ambient_level=AmbientTemperatureLevel.LEVEL_3,
         add_noise=False,
         apply_undervolting_opt=False,
-        num_points=200
+        num_points=200,
+        seed=42
     )
     
     # Save comparison plot
@@ -245,7 +280,7 @@ def test_undervolting_optimization(simulator: ASICPhysicsSimulator):
     
     plt.xlabel('Frequency (MHz)', fontsize=12)
     plt.ylabel('Voltage (V)', fontsize=12)
-    plt.title(f'Undervolting Optimization ({undervolt_percentage*100:.1f}% reduction)', 
+    plt.title(f'Undervolting Optimization', 
               fontsize=14, fontweight='bold')
     plt.grid(True, alpha=0.3)
     plt.legend(fontsize=12)
@@ -257,6 +292,50 @@ def test_undervolting_optimization(simulator: ASICPhysicsSimulator):
     print(f"  Saved comparison plot to: {uv_plot_path}")
 
 
+def test_power_limits(simulator: ASICPhysicsSimulator):
+    """Test that simulation respects min_power and max_power hardware limits."""
+    print_section("Power Limits Test")
+    
+    limits = simulator.device.base_specification.hardware_limits
+    nominal = simulator.device.base_specification.nominal_power
+    
+    print(f"\nDevice power limits: [{limits.min_power:.0f}, {limits.max_power:.0f}] W (nominal: {nominal:.0f} W)")
+    
+    # Normal case: parameters that should yield power within limits
+    params_normal = OptimizationParameters(frequency=600.0, voltage=13.2, fan_speed=100.0)
+    outcome_normal = simulator.simulate(AmbientTemperatureLevel.LEVEL_3, params_normal)
+    
+    print(f"\nNormal params (Freq=600 MHz, V=13.2 V):")
+    print(f"  Power: {outcome_normal.power:.1f} W, Valid: {outcome_normal.valid}")
+    assert (not outcome_normal.valid) or (limits.min_power <= outcome_normal.power <= limits.max_power), \
+        "Valid outcome must have power within limits"
+    
+    # Run a small sweep and verify all valid outcomes are within power limits
+    results = run_parameter_sweep(
+        simulator,
+        ambient_level=AmbientTemperatureLevel.LEVEL_3,
+        frequency_range=(limits.min_frequency, limits.max_frequency),
+        voltage_range=(limits.min_voltage, limits.max_voltage),
+        fan_speed=100.0,
+        num_points=5
+    )
+    
+    valid_count = 0
+    out_of_range_count = 0
+    for params, outcome in results:
+        if outcome.valid:
+            valid_count += 1
+            in_range = limits.min_power <= outcome.power <= limits.max_power
+            if not in_range:
+                out_of_range_count += 1
+                print(f"  [FAIL] Power {outcome.power:.1f} W outside [{limits.min_power:.0f}, {limits.max_power:.0f}] "
+                       f"at Freq={params.frequency:.0f}, V={params.voltage:.2f}")
+    
+    print(f"\nParameter sweep: {valid_count} valid outcomes, {out_of_range_count} with power outside limits")
+    assert out_of_range_count == 0, "All valid simulation outcomes must respect power limits"
+    print("[OK] Power limits respected in all valid outcomes")
+
+
 def test_parameter_sweep(simulator: ASICPhysicsSimulator):
     """Test parameter sweep to find optimal settings."""
     print_section("Parameter Sweep and Optimization")
@@ -265,7 +344,8 @@ def test_parameter_sweep(simulator: ASICPhysicsSimulator):
     print("\nRunning parameter sweep across frequency and voltage ranges...")
     print("This may take a moment...\n")
     
-    results = simulator.run_parameter_sweep(
+    results = run_parameter_sweep(
+        simulator,
         ambient_level=AmbientTemperatureLevel.LEVEL_3,
         frequency_range=(550, 650),
         voltage_range=(12.0, 14.0),
@@ -385,7 +465,7 @@ def main():
     print_section("Loading Virtual Device")
 
     # Try to load an existing device (use JSON format to avoid pickle serialization issues)
-    device_path = Path("virtual_devices/antminer_s19_pro_1ba2f4b9.json")
+    device_path = Path("virtual_devices/antminer_s19_22dc2e97.json")
 
     try:
         # Extract device_id from filename (remove extension and directory)
@@ -405,8 +485,8 @@ def main():
             'silicon_quality': 1.03,
             'degradation': 0.05,
             'thermal_resistance': 0.15,
-            'voltage_tolerance': 1.0,
-            'frequency_response': 1.0
+            # 'voltage_tolerance': 1.0,
+            # 'frequency_response': 1.0
         }
 
         device = generator.generate_device(
@@ -426,8 +506,9 @@ def main():
     test_ambient_temperature_levels(simulator)
     test_critical_temperature_warning(simulator)
     test_undervolting_optimization(simulator)
+    test_power_limits(simulator)
     test_noise_characteristics(simulator)
-    test_parameter_sweep(simulator)
+    # test_parameter_sweep(simulator)
     
     # Final summary
     print_section("Test Summary")

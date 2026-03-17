@@ -12,7 +12,7 @@ Version: 1.0
 
 import json
 import pickle
-import hashlib
+import random
 from dataclasses import dataclass, asdict
 from typing import Dict, List, Optional, Union
 from pathlib import Path
@@ -37,14 +37,10 @@ class HiddenParameters:
         silicon_quality: Multiplier for efficiency (typically 0.92 - 1.08, 5-8% variance)
         degradation: Efficiency loss due to age (0.0 - 0.2, 0-20% loss)
         thermal_resistance: Thermal resistance in °C/W
-        voltage_tolerance: Voltage operating range multiplier (0.95 - 1.05)
-        frequency_response: Frequency scaling factor (0.98 - 1.02)
     """
     silicon_quality: float
     degradation: float
     thermal_resistance: float
-    voltage_tolerance: float
-    frequency_response: float
     
     def to_dict(self) -> Dict:
         """Convert hidden parameters to dictionary."""
@@ -69,6 +65,8 @@ class HardwareLimits:
         max_safe_temperature: Maximum safe operating temperature in Celsius
         min_fan_speed: Minimum fan speed percentage
         max_fan_speed: Maximum fan speed percentage
+        min_power: Minimum power consumption in Watts (nominal_power - 500)
+        max_power: Maximum power consumption in Watts (nominal_power + 500)
     """
     min_frequency: float
     max_frequency: float
@@ -77,6 +75,8 @@ class HardwareLimits:
     max_safe_temperature: float
     min_fan_speed: float
     max_fan_speed: float
+    min_power: float
+    max_power: float
     
     def to_dict(self) -> Dict:
         """Convert hardware limits to dictionary."""
@@ -102,6 +102,8 @@ class ASICModelSpecification:
         optimal_voltage: Optimal operating voltage in Volts
         base_thermal_resistance: Base thermal resistance in °C/W
         manufacturer_frequency: Manufacturer specified frequency in MHz (e.g., 600.0 for S19 Pro)
+        efficiency: PSU/wall efficiency multiplier (P_wall = P_chip / efficiency)
+        C: Switching/dynamic power constant for P_chip = C * V^2 * frequency
         hardware_limits: Hardware operational limits
     """
     name: str
@@ -112,6 +114,8 @@ class ASICModelSpecification:
     optimal_voltage: float  # Volts
     base_thermal_resistance: float  # °C/W
     manufacturer_frequency: float  # MHz
+    efficiency: float
+    C: float
     hardware_limits: HardwareLimits
     
     def to_dict(self) -> Dict:
@@ -123,12 +127,31 @@ class ASICModelSpecification:
     @classmethod
     def from_dict(cls, data: Dict) -> 'ASICModelSpecification':
         """Create ASIC specification from dictionary."""
-        data['hardware_limits'] = HardwareLimits.from_dict(data['hardware_limits'])
+        hl = data['hardware_limits']
+        nominal = data['nominal_power']
+        # Backward compatibility: derive min_power/max_power from nominal_power if missing
+        if 'min_power' not in hl:
+            hl = {**hl, 'min_power': nominal - 500.0}
+        if 'max_power' not in hl:
+            hl = {**hl, 'max_power': nominal + 500.0}
+        data['hardware_limits'] = HardwareLimits.from_dict(hl)
         
         # Handle missing manufacturer_frequency field for backward compatibility
         if 'manufacturer_frequency' not in data:
             # Use max_frequency from hardware limits as a reasonable default
             data['manufacturer_frequency'] = data['hardware_limits'].max_frequency
+
+        # Backward compatibility: derive efficiency and C if missing
+        # P_wall = P_chip / efficiency, P_chip = C * V^2 * f
+        if 'efficiency' not in data:
+            data['efficiency'] = 0.92
+        if 'C' not in data:
+            eff = float(data['efficiency'])
+            v = float(data['optimal_voltage'])
+            f = float(data['manufacturer_frequency'])
+            # Choose C so that P_wall at nominal equals nominal_power
+            # nominal_power = (C * v^2 * f) / eff  =>  C = nominal_power * eff / (v^2 * f)
+            data['C'] = float(data['nominal_power']) * eff / (v * v * f)
         
         return cls(**data)
 
@@ -190,9 +213,7 @@ class VirtualDeviceGenerator:
             hidden_params={
                 'silicon_quality': 1.02,
                 'degradation': 0.05,
-                'thermal_resistance': 0.15,
-                'voltage_tolerance': 1.0,
-                'frequency_response': 1.0
+                'thermal_resistance': 0.15
             }
         )
         
@@ -274,12 +295,20 @@ class VirtualDeviceGenerator:
         """
         return list(self._asic_models.keys())
     
+    def load_builtin_specifications(self) -> None:
+        """
+        Load ASIC model specifications from the built-in configuration storage.
+        Call get_builtin_asic_configurations() for the underlying data.
+        """
+        self.load_specifications_from_dict(get_builtin_asic_configurations())
+    
     def generate_device(
         self,
         model_name: str,
         hidden_params: Dict[str, float],
         electricity_price: float = 0.05,
-        device_id: Optional[str] = None
+        device_id: Optional[str] = None,
+        apply_thermal_resistance_spread: bool = True
     ) -> VirtualDevice:
         """
         Generate a virtual device with specified hidden parameters.
@@ -289,17 +318,17 @@ class VirtualDeviceGenerator:
         
         This method creates a virtual device using the provided hidden parameters.
         It does NOT generate any parameter values - all values must be provided.
-        
+
         Args:
             model_name: Name of the ASIC model to base device on
             hidden_params: Dictionary containing hidden parameter values:
                 - silicon_quality: float (typically 0.92 - 1.08)
                 - degradation: float (0.0 - 0.2)
-                - thermal_resistance: float (°C/W)
-                - voltage_tolerance: float (0.95 - 1.05)
-                - frequency_response: float (0.98 - 1.02)
+                - thermal_resistance: float (°C/W); ignored if apply_thermal_resistance_spread=True
             electricity_price: Electricity price in USD/kWh (default: 0.05)
             device_id: Optional custom device ID. If not provided, generates unique ID.
+            apply_thermal_resistance_spread: If True, thermal_resistance is sampled from
+                base_specification.base_thermal_resistance with ±5% uniform spread.
         
         Returns:
             VirtualDevice object with specified hidden parameters
@@ -313,19 +342,22 @@ class VirtualDeviceGenerator:
             raise ValueError(f"Model '{model_name}' not found. Available models: {available}")
         
         # Validate hidden parameters
-        required_params = ['silicon_quality', 'degradation', 'thermal_resistance', 
-                          'voltage_tolerance', 'frequency_response']
+        required_params = ['silicon_quality', 'degradation', 'thermal_resistance']
         for param in required_params:
             if param not in hidden_params:
                 raise ValueError(f"Missing required hidden parameter: {param}")
+        
+        base_spec = self._asic_models[model_name]
+        thermal_resistance = float(hidden_params['thermal_resistance'])
+        if apply_thermal_resistance_spread:
+            # ±5% uniform spread around base_thermal_resistance
+            thermal_resistance = base_spec.base_thermal_resistance * random.uniform(0.95, 1.05)
         
         # Create hidden parameters object
         hidden = HiddenParameters(
             silicon_quality=float(hidden_params['silicon_quality']),
             degradation=float(hidden_params['degradation']),
-            thermal_resistance=float(hidden_params['thermal_resistance']),
-            voltage_tolerance=float(hidden_params['voltage_tolerance']),
-            frequency_response=float(hidden_params['frequency_response'])
+            thermal_resistance=thermal_resistance
         )
         
         # Generate device ID if not provided
@@ -333,14 +365,14 @@ class VirtualDeviceGenerator:
             device_id = self._generate_device_id(model_name)
         
         # Create virtual device
-        from datetime import datetime
+        from datetime import datetime, timezone
         device = VirtualDevice(
             device_id=device_id,
             asic_model=model_name,
             hidden_parameters=hidden,
             base_specification=self._asic_models[model_name],
             electricity_price=electricity_price,
-            created_at=datetime.utcnow().isoformat()
+            created_at=datetime.now(timezone.utc).isoformat()
         )
         
         # Store device
@@ -521,11 +553,26 @@ class VirtualDeviceGenerator:
         if not directory.exists():
             raise FileNotFoundError(f"Directory not found: {directory}")
         
+        # Determine which file extensions to look for based on format
+        if format == 'pickle':
+            extensions = {'.pkl'}
+        elif format == 'json':
+            extensions = {'.json'}
+        elif format == 'yaml':
+            extensions = {'.yaml', '.yml'}
+        else:
+            # If no format specified, try all supported extensions
+            extensions = {'.pkl', '.json', '.yaml', '.yml'}
+        
         devices = []
         for filepath in directory.iterdir():
-            if filepath.is_file():
+            if filepath.is_file() and filepath.suffix.lower() in extensions:
                 try:
                     device = self.load_device(filepath, format)
+                    # Skip specification files (they don't have device_id)
+                    if not hasattr(device, 'device_id'):
+                        print(f"Warning: Skipping specification file {filepath.name} (not a device)")
+                        continue
                     devices.append(device)
                 except Exception as e:
                     print(f"Warning: Failed to load {filepath}: {e}")
@@ -586,251 +633,293 @@ class VirtualDeviceGenerator:
 
 
 # ============================================================================
-# Example Usage and Test Data
+# Built-in ASIC configurations storage
 # ============================================================================
 
-def create_example_asic_specifications() -> Dict:
+def get_builtin_asic_configurations() -> Dict:
     """
-    Create example ASIC model specifications based on research data.
-    
-    These specifications are based on publicly available data for popular
-    ASIC miners. All values are from actual manufacturer specifications.
-    
-    Returns:
-        Dictionary of ASIC model specifications
+    Return built-in ASIC model configurations.
+    Use load_builtin_specifications() on VirtualDeviceGenerator to load these.
+    silicon_quality and degradation are not stored here; use example ranges
+    (e.g. 0.92–1.08, 0.0–0.2) when generating devices.
     """
-    specifications = {
-        "Antminer S19 Pro": {
-            "name": "Antminer S19 Pro",
+    return {
+        "Antminer S19": {
+            "name": "Antminer S19",
             "manufacturer": "Bitmain",
-            "nominal_hashrate": 110.0,
+            "nominal_hashrate": 95.0,
             "nominal_power": 3250.0,
-            "hashrate_per_mhz": 0.183,
-            "optimal_voltage": 13.2,
-            "base_thermal_resistance": 0.15,
+            "hashrate_per_mhz": 0.158,
+            "optimal_voltage": 13.0,
+            "base_thermal_resistance": 0.0265,
+            "manufacturer_frequency": 600.0,
+            "efficiency": 0.92,
+            "C": 0.02948,
             "hardware_limits": {
                 "min_frequency": 500.0,
-                "max_frequency": 650.0,
+                "max_frequency": 750.0,
                 "min_voltage": 11.5,
                 "max_voltage": 14.5,
                 "max_safe_temperature": 85.0,
                 "min_fan_speed": 0.0,
-                "max_fan_speed": 100.0
+                "max_fan_speed": 100.0,
+                "min_power": 2750.0,
+                "max_power": 3750.0,
             }
         },
-        "Antminer S19 XP": {
-            "name": "Antminer S19 XP",
-            "manufacturer": "Bitmain",
-            "nominal_hashrate": 140.0,
-            "nominal_power": 3010.0,
-            "hashrate_per_mhz": 0.233,
-            "optimal_voltage": 13.0,
-            "base_thermal_resistance": 0.14,
-            "hardware_limits": {
-                "min_frequency": 520.0,
-                "max_frequency": 680.0,
-                "min_voltage": 11.8,
-                "max_voltage": 14.2,
-                "max_safe_temperature": 85.0,
-                "min_fan_speed": 0.0,
-                "max_fan_speed": 100.0
-            }
-        },
-        "Whatsminer M30S++": {
-            "name": "Whatsminer M30S++",
-            "manufacturer": "MicroBT",
-            "nominal_hashrate": 112.0,
-            "nominal_power": 3472.0,
-            "hashrate_per_mhz": 0.187,
-            "optimal_voltage": 13.5,
-            "base_thermal_resistance": 0.16,
-            "hardware_limits": {
-                "min_frequency": 510.0,
-                "max_frequency": 660.0,
-                "min_voltage": 12.0,
-                "max_voltage": 14.8,
-                "max_safe_temperature": 85.0,
-                "min_fan_speed": 0.0,
-                "max_fan_speed": 100.0
-            }
-        }
     }
-    return specifications
 
 
-def create_example_hidden_parameters() -> List[Dict[str, float]]:
-    """
-    Create example hidden parameter sets based on research data.
+# ============================================================================
+# Example Usage and Test Data
+# ============================================================================
+
+# def create_example_asic_specifications() -> Dict:
+#     """
+#     Create example ASIC model specifications based on research data.
     
-    These parameter sets represent realistic variations observed in
-    ASIC manufacturing and aging studies.
+#     These specifications are based on publicly available data for popular
+#     ASIC miners. All values are from actual manufacturer specifications.
     
-    Returns:
-        List of hidden parameter dictionaries
-    """
-    # Example 1: High-quality, new device
-    params_new = {
-        'silicon_quality': 1.05,
-        'degradation': 0.02,
-        'thermal_resistance': 0.142,
-        'voltage_tolerance': 1.02,
-        'frequency_response': 1.01
-    }
-    
-    # Example 2: Average quality, moderately used
-    params_avg = {
-        'silicon_quality': 1.00,
-        'degradation': 0.10,
-        'thermal_resistance': 0.150,
-        'voltage_tolerance': 1.00,
-        'frequency_response': 1.00
-    }
-    
-    # Example 3: Lower quality, heavily used
-    params_old = {
-        'silicon_quality': 0.94,
-        'degradation': 0.18,
-        'thermal_resistance': 0.165,
-        'voltage_tolerance': 0.97,
-        'frequency_response': 0.99
-    }
-    
-    return [params_new, params_avg, params_old]
+#     Returns:
+#         Dictionary of ASIC model specifications
+#     """
+#     specifications = {
+#         "Antminer S19 Pro": {
+#             "name": "Antminer S19 Pro",
+#             "manufacturer": "Bitmain",
+#             "nominal_hashrate": 110.0,
+#             "nominal_power": 3250.0,
+#             "hashrate_per_mhz": 0.183,
+#             "optimal_voltage": 13.2,
+#             "base_thermal_resistance": 0.15,
+#             "hardware_limits": {
+#                 "min_frequency": 500.0,
+#                 "max_frequency": 650.0,
+#                 "min_voltage": 11.5,
+#                 "max_voltage": 14.5,
+#                 "max_safe_temperature": 85.0,
+#                 "min_fan_speed": 0.0,
+#                 "max_fan_speed": 100.0,
+#                 "min_power": 2750.0,
+#                 "max_power": 3750.0
+#             }
+#         },
+#         "Antminer S19 XP": {
+#             "name": "Antminer S19 XP",
+#             "manufacturer": "Bitmain",
+#             "nominal_hashrate": 140.0,
+#             "nominal_power": 3010.0,
+#             "hashrate_per_mhz": 0.233,
+#             "optimal_voltage": 13.0,
+#             "base_thermal_resistance": 0.14,
+#             "hardware_limits": {
+#                 "min_frequency": 520.0,
+#                 "max_frequency": 680.0,
+#                 "min_voltage": 11.8,
+#                 "max_voltage": 14.2,
+#                 "max_safe_temperature": 85.0,
+#                 "min_fan_speed": 0.0,
+#                 "max_fan_speed": 100.0,
+#                 "min_power": 2510.0,
+#                 "max_power": 3510.0
+#             }
+#         },
+#         "Whatsminer M30S++": {
+#             "name": "Whatsminer M30S++",
+#             "manufacturer": "MicroBT",
+#             "nominal_hashrate": 112.0,
+#             "nominal_power": 3472.0,
+#             "hashrate_per_mhz": 0.187,
+#             "optimal_voltage": 13.5,
+#             "base_thermal_resistance": 0.16,
+#             "hardware_limits": {
+#                 "min_frequency": 510.0,
+#                 "max_frequency": 660.0,
+#                 "min_voltage": 12.0,
+#                 "max_voltage": 14.8,
+#                 "max_safe_temperature": 85.0,
+#                 "min_fan_speed": 0.0,
+#                 "max_fan_speed": 100.0,
+#                 "min_power": 2972.0,
+#                 "max_power": 3972.0
+#             }
+#         }
+#     }
+#     return specifications
 
 
-def main():
-    """
-    Example usage of the Virtual Device Generator.
+# def create_example_hidden_parameters() -> List[Dict[str, float]]:
+#     """
+#     Create example hidden parameter sets based on research data.
     
-    This demonstrates:
-    1. Loading ASIC specifications from a dictionary
-    2. Generating virtual devices with specific hidden parameters
-    3. Saving devices locally for reproducible testing
-    4. Loading devices from files
-    """
-    print("=" * 80)
-    print("Virtual Device Generator - Example Usage")
-    print("=" * 80)
-    print()
+#     These parameter sets represent realistic variations observed in
+#     ASIC manufacturing and aging studies.
     
-    # Initialize generator
-    generator = VirtualDeviceGenerator()
-    print("[OK] Initialized Virtual Device Generator")
-    print()
+#     Returns:
+#         List of hidden parameter dictionaries
+#     """
+#     # Example 1: High-quality, new device
+#     params_new = {
+#         'silicon_quality': 1.05,
+#         'degradation': 0.02,
+#         'thermal_resistance': 0.142
+#     }
     
-    # Load ASIC specifications from dictionary
-    print("Step 1: Loading ASIC specifications from dictionary...")
-    specs = create_example_asic_specifications()
-    generator.load_specifications_from_dict(specs)
-    print(f"[OK] Loaded {len(generator.get_available_models())} ASIC models:")
-    for model in generator.get_available_models():
-        spec = generator._asic_models[model]
-        print(f"  - {model}: {spec.nominal_hashrate} TH/s @ {spec.nominal_power}W")
-    print()
+#     # Example 2: Average quality, moderately used
+#     params_avg = {
+#         'silicon_quality': 1.00,
+#         'degradation': 0.10,
+#         'thermal_resistance': 0.150
+#     }
     
-    # Generate virtual devices
-    print("Step 2: Generating virtual devices with hidden parameters...")
-    hidden_params_list = create_example_hidden_parameters()
+#     # Example 3: Lower quality, heavily used
+#     params_old = {
+#         'silicon_quality': 0.94,
+#         'degradation': 0.18,
+#         'thermal_resistance': 0.165
+#     }
     
-    devices = []
-    for i, hidden_params in enumerate(hidden_params_list, 1):
-        device = generator.generate_device(
-            model_name="Antminer S19 Pro",
-            hidden_params=hidden_params,
-            electricity_price=0.05
-        )
-        devices.append(device)
-        print(f"[OK] Generated device {i}: {device.device_id}")
-        print(f"  - Silicon quality: {device.hidden_parameters.silicon_quality:.3f}")
-        print(f"  - Degradation: {device.hidden_parameters.degradation:.3f}")
-        print(f"  - Thermal resistance: {device.hidden_parameters.thermal_resistance:.3f} °C/W")
-        print(f"  - Electricity price: ${device.electricity_price:.3f} / kWh")
-    print()
+#     return [params_new, params_avg, params_old]
+
+
+# def main():
+#     """
+#     Example usage of the Virtual Device Generator.
     
-    # Save devices to files
-    print("Step 3: Saving devices to local files...")
-    output_dir = Path("virtual_devices")
-    for i, device in enumerate(devices, 1):
-        # Save in different formats
-        generator.save_device(device, output_dir / f"{device.device_id}.pkl", format='pickle')
-        generator.save_device(device, output_dir / f"{device.device_id}.json", format='json')
-        print(f"[OK] Saved device {i} to {output_dir}/{device.device_id}.{{pkl,json}}")
-    print()
+#     This demonstrates:
+#     1. Loading ASIC specifications from a dictionary
+#     2. Generating virtual devices with specific hidden parameters
+#     3. Saving devices locally for reproducible testing
+#     4. Loading devices from files
+#     """
+#     print("=" * 80)
+#     print("Virtual Device Generator - Example Usage")
+#     print("=" * 80)
+#     print()
     
-    # Export specifications
-    print("Step 4: Exporting ASIC specifications...")
-    generator.export_specifications(output_dir / "asic_specifications.json", format='json')
-    print(f"[OK] Exported specifications to {output_dir}/asic_specifications.json")
-    print()
+#     # Initialize generator
+#     generator = VirtualDeviceGenerator()
+#     print("[OK] Initialized Virtual Device Generator")
+#     print()
     
-    # Load devices from files
-    print("Step 5: Loading devices from files...")
-    loaded_devices = generator.load_all_devices(output_dir, format='json')
-    print(f"[OK] Loaded {len(loaded_devices)} devices from files")
-    print()
+#     # Load ASIC specifications from dictionary
+#     print("Step 1: Loading ASIC specifications from dictionary...")
+#     specs = create_example_asic_specifications()
+#     generator.load_specifications_from_dict(specs)
+#     print(f"[OK] Loaded {len(generator.get_available_models())} ASIC models:")
+#     for model in generator.get_available_models():
+#         spec = generator._asic_models[model]
+#         print(f"  - {model}: {spec.nominal_hashrate} TH/s @ {spec.nominal_power}W")
+#     print()
     
-    # Verify reproducibility
-    print("Step 6: Verifying reproducibility...")
+#     # Generate virtual devices
+#     print("Step 2: Generating virtual devices with hidden parameters...")
+#     hidden_params_list = create_example_hidden_parameters()
     
-    # Create dictionaries mapping device_id to device for both lists
-    original_dict = {device.device_id: device for device in devices}
-    loaded_dict = {device.device_id: device for device in loaded_devices}
+#     devices = []
+#     for i, hidden_params in enumerate(hidden_params_list, 1):
+#         device = generator.generate_device(
+#             model_name="Antminer S19 Pro",
+#             hidden_params=hidden_params,
+#             electricity_price=0.05
+#         )
+#         devices.append(device)
+#         print(f"[OK] Generated device {i}: {device.device_id}")
+#         print(f"  - Silicon quality: {device.hidden_parameters.silicon_quality:.3f}")
+#         print(f"  - Degradation: {device.hidden_parameters.degradation:.3f}")
+#         print(f"  - Thermal resistance: {device.hidden_parameters.thermal_resistance:.3f} °C/W")
+#         print(f"  - Electricity price: ${device.electricity_price:.3f} / kWh")
+#     print()
     
-    # Verify all devices were loaded correctly
-    assert len(original_dict) == len(loaded_dict), f"Device count mismatch: {len(original_dict)} original vs {len(loaded_dict)} loaded"
+#     # Save devices to files
+#     print("Step 3: Saving devices to local files...")
+#     output_dir = Path("virtual_devices")
     
-    # Compare each device by device_id
-    for device_id in original_dict:
-        original = original_dict[device_id]
-        loaded = loaded_dict[device_id]
+#     # Clear old device files from the directory
+#     if output_dir.exists():
+#         print("  - Clearing old device files...")
+#         for filepath in output_dir.iterdir():
+#             if filepath.is_file():
+#                 filepath.unlink()
+#         print("  - [OK] Old files cleared")
+#     for i, device in enumerate(devices, 1):
+#         # Save in different formats
+#         generator.save_device(device, output_dir / f"{device.device_id}.pkl", format='pickle')
+#         generator.save_device(device, output_dir / f"{device.device_id}.json", format='json')
+#         print(f"[OK] Saved device {i} to {output_dir}/{device.device_id}.{{pkl,json}}")
+#     print()
+    
+#     # Export specifications
+#     print("Step 4: Exporting ASIC specifications...")
+#     generator.export_specifications(output_dir / "asic_specifications.json", format='json')
+#     print(f"[OK] Exported specifications to {output_dir}/asic_specifications.json")
+#     print()
+    
+#     # Load devices from files
+#     print("Step 5: Loading devices from files...")
+#     loaded_devices = generator.load_all_devices(output_dir, format='json')
+#     print(f"[OK] Loaded {len(loaded_devices)} devices from files")
+#     print()
+    
+#     # Verify reproducibility
+#     print("Step 6: Verifying reproducibility...")
+    
+#     # Create dictionaries mapping device_id to device for both lists
+#     original_dict = {device.device_id: device for device in devices}
+#     loaded_dict = {device.device_id: device for device in loaded_devices}
+    
+#     # Verify all devices were loaded correctly
+#     assert len(original_dict) == len(loaded_dict), f"Device count mismatch: {len(original_dict)} original vs {len(loaded_dict)} loaded"
+    
+#     # Compare each device by device_id
+#     for device_id in original_dict:
+#         original = original_dict[device_id]
+#         loaded = loaded_dict[device_id]
         
-        assert original.device_id == loaded.device_id, f"Device ID mismatch for {device_id}"
-        assert abs(original.hidden_parameters.silicon_quality - loaded.hidden_parameters.silicon_quality) < 1e-10, f"Silicon quality mismatch for {device_id}"
-        assert abs(original.hidden_parameters.degradation - loaded.hidden_parameters.degradation) < 1e-10, f"Degradation mismatch for {device_id}"
-        assert abs(original.hidden_parameters.thermal_resistance - loaded.hidden_parameters.thermal_resistance) < 1e-10, f"Thermal resistance mismatch for {device_id}"
-        assert abs(original.hidden_parameters.voltage_tolerance - loaded.hidden_parameters.voltage_tolerance) < 1e-10, f"Voltage tolerance mismatch for {device_id}"
-        assert abs(original.hidden_parameters.frequency_response - loaded.hidden_parameters.frequency_response) < 1e-10, f"Frequency response mismatch for {device_id}"
-        assert abs(original.electricity_price - loaded.electricity_price) < 1e-10, f"Electricity price mismatch for {device_id}"
+#         assert original.device_id == loaded.device_id, f"Device ID mismatch for {device_id}"
+#         assert abs(original.hidden_parameters.silicon_quality - loaded.hidden_parameters.silicon_quality) < 1e-10, f"Silicon quality mismatch for {device_id}"
+#         assert abs(original.hidden_parameters.degradation - loaded.hidden_parameters.degradation) < 1e-10, f"Degradation mismatch for {device_id}"
+#         assert abs(original.hidden_parameters.thermal_resistance - loaded.hidden_parameters.thermal_resistance) < 1e-10, f"Thermal resistance mismatch for {device_id}"
+#         assert abs(original.electricity_price - loaded.electricity_price) < 1e-10, f"Electricity price mismatch for {device_id}"
     
-    print(f"[OK] Loaded {len(loaded_devices)} devices match original devices - reproducibility verified!")
-    print()
+#     print(f"[OK] Loaded {len(loaded_devices)} devices match original devices - reproducibility verified!")
+#     print()
     
-    # Load specifications from file
-    print("Step 7: Loading specifications from file...")
-    generator2 = VirtualDeviceGenerator()
-    generator2.load_specifications_from_file(output_dir / "asic_specifications.json")
-    print(f"[OK] Loaded {len(generator2.get_available_models())} models from file")
-    print()
+#     # Load specifications from file
+#     print("Step 7: Loading specifications from file...")
+#     generator2 = VirtualDeviceGenerator()
+#     generator2.load_specifications_from_file(output_dir / "asic_specifications.json")
+#     print(f"[OK] Loaded {len(generator2.get_available_models())} models from file")
+#     print()
     
-    # Generate device with loaded specifications
-    print("Step 8: Generating device from file-loaded specifications...")
-    device_from_file = generator2.generate_device(
-        model_name="Antminer S19 Pro",
-        hidden_params={
-            'silicon_quality': 0.98,
-            'degradation': 0.05,
-            'thermal_resistance': 0.148,
-            'voltage_tolerance': 0.99,
-            'frequency_response': 1.00
-        },
-        electricity_price=0.05
-    )
-    print(f"[OK] Generated device: {device_from_file.device_id}")
-    print()
+#     # Generate device with loaded specifications
+#     print("Step 8: Generating device from file-loaded specifications...")
+#     device_from_file = generator2.generate_device(
+#         model_name="Antminer S19 Pro",
+#         hidden_params={
+#             'silicon_quality': 0.98,
+#             'degradation': 0.05,
+#             'thermal_resistance': 0.148
+#         },
+#         electricity_price=0.05
+#     )
+#     print(f"[OK] Generated device: {device_from_file.device_id}")
+#     print()
     
-    print("=" * 80)
-    print("Example completed successfully!")
-    print("=" * 80)
-    print()
-    print("Summary:")
-    print(f"  - ASIC models loaded: {len(generator.get_available_models())}")
-    print(f"  - Virtual devices generated: {len(devices)}")
-    print(f"  - Devices saved to: {output_dir}/")
-    print(f"  - Reproducibility: Verified [OK]")
-    print()
-    print("The Virtual Device Generator is ready for modular testing!")
-    print()
+#     print("=" * 80)
+#     print("Example completed successfully!")
+#     print("=" * 80)
+#     print()
+#     print("Summary:")
+#     print(f"  - ASIC models loaded: {len(generator.get_available_models())}")
+#     print(f"  - Virtual devices generated: {len(devices)}")
+#     print(f"  - Devices saved to: {output_dir}/")
+#     print(f"  - Reproducibility: Verified [OK]")
+#     print()
+#     print("The Virtual Device Generator is ready for modular testing!")
+#     print()
 
 
-if __name__ == "__main__":
-    main()
+# if __name__ == "__main__":
+#     main()
