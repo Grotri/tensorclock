@@ -37,7 +37,7 @@ def generate_virtual_devices_from_templates(
     db_path: str = str(default_db_path()),
 ) -> None:
     """
-    Generate virtual devices for all built-in ASIC templates and store them in SQLite.
+    Generate virtual devices for all built-in ASIC templates and store them in DB.
 
     All randomness configured in the generator is preserved:
     - Hidden parameters use random silicon_quality and degradation.
@@ -79,7 +79,7 @@ def generate_virtual_devices_from_templates(
                 print(f"  [OK] Enough devices already present in DB (creator_version={DEVICE_CREATOR_VERSION})")
         conn.commit()
 
-    print(f"\n[OK] Virtual devices stored in SQLite: {db_path}")
+    print(f"\n[OK] Virtual devices stored in DB: {db_path}")
 
 
 def main() -> None:

@@ -5,7 +5,7 @@ This module implements a minimal Task Manager aligned with the
 `agent_workflows/architecture_design.md` document.
 
 Features implemented here:
-- Generate a full task bundle for a specific ASIC model (persisted in SQLite).
+- Generate a full task bundle for a specific ASIC model (persisted in DB).
 - Always uses 5 virtual devices (reuses existing when available).
 - Always uses 5 ambient environments (all AmbientTemperatureLevel values).
 - Creates one test task per (device, ambient_level) pair.
@@ -15,15 +15,14 @@ Features implemented here:
 from __future__ import annotations
 
 import json
-import sqlite3
 import uuid
 from dataclasses import dataclass, asdict
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Dict, List, Literal, Optional, Tuple
+from typing import Any, Dict, List, Literal, Optional, Tuple
 
 from init_db import connect, default_db_path, init_db
-from virtual_device_generator import VirtualDeviceGenerator, flatten_virtual_device_for_db
+from virtual_device_generator import VirtualDeviceGenerator
 from asic_physics_simulator import AmbientTemperatureLevel
 from version import DB_SCHEMA_VERSION, TASK_CREATOR_VERSION
 
@@ -78,11 +77,11 @@ def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
-def _default_db_path() -> Path:
+def _default_db_path() -> str:
     return default_db_path()
 
 
-def _fetch_device_ids(conn: sqlite3.Connection, asic_model: str, limit: int) -> List[str]:
+def _fetch_device_ids(conn: Any, asic_model: str, limit: int) -> List[str]:
     rows = conn.execute(
         "SELECT device_id FROM devices WHERE asic_model = ? ORDER BY created_at DESC LIMIT ?",
         (asic_model, limit),
@@ -90,60 +89,8 @@ def _fetch_device_ids(conn: sqlite3.Connection, asic_model: str, limit: int) -> 
     return [r["device_id"] for r in rows]
 
 
-def _upsert_device_row(conn: sqlite3.Connection, row: Dict[str, object]) -> None:
-    conn.execute(
-        """
-        INSERT INTO devices (
-            device_id, asic_model, electricity_price, created_at,
-            silicon_quality, degradation, thermal_resistance,
-            spec_name, spec_manufacturer, nominal_hashrate, nominal_power, hashrate_per_mhz,
-            optimal_voltage, base_thermal_resistance, manufacturer_frequency, efficiency, C,
-            min_frequency, max_frequency, min_voltage, max_voltage, max_safe_temperature,
-            min_fan_speed, max_fan_speed, min_power, max_power,
-            device_json
-        ) VALUES (
-            :device_id, :asic_model, :electricity_price, :created_at,
-            :silicon_quality, :degradation, :thermal_resistance,
-            :spec_name, :spec_manufacturer, :nominal_hashrate, :nominal_power, :hashrate_per_mhz,
-            :optimal_voltage, :base_thermal_resistance, :manufacturer_frequency, :efficiency, :C,
-            :min_frequency, :max_frequency, :min_voltage, :max_voltage, :max_safe_temperature,
-            :min_fan_speed, :max_fan_speed, :min_power, :max_power,
-            :device_json
-        )
-        ON CONFLICT(device_id) DO UPDATE SET
-            asic_model=excluded.asic_model,
-            electricity_price=excluded.electricity_price,
-            created_at=excluded.created_at,
-            silicon_quality=excluded.silicon_quality,
-            degradation=excluded.degradation,
-            thermal_resistance=excluded.thermal_resistance,
-            spec_name=excluded.spec_name,
-            spec_manufacturer=excluded.spec_manufacturer,
-            nominal_hashrate=excluded.nominal_hashrate,
-            nominal_power=excluded.nominal_power,
-            hashrate_per_mhz=excluded.hashrate_per_mhz,
-            optimal_voltage=excluded.optimal_voltage,
-            base_thermal_resistance=excluded.base_thermal_resistance,
-            manufacturer_frequency=excluded.manufacturer_frequency,
-            efficiency=excluded.efficiency,
-            C=excluded.C,
-            min_frequency=excluded.min_frequency,
-            max_frequency=excluded.max_frequency,
-            min_voltage=excluded.min_voltage,
-            max_voltage=excluded.max_voltage,
-            max_safe_temperature=excluded.max_safe_temperature,
-            min_fan_speed=excluded.min_fan_speed,
-            max_fan_speed=excluded.max_fan_speed,
-            min_power=excluded.min_power,
-            max_power=excluded.max_power,
-            device_json=excluded.device_json
-        """,
-        row,
-    )
-
-
 def _ensure_devices(
-    conn: sqlite3.Connection,
+    conn: Any,
     generator: VirtualDeviceGenerator,
     asic_model: str,
     devices_count: int,
@@ -170,19 +117,18 @@ def _ensure_devices(
             electricity_price=0.05,
             apply_thermal_resistance_spread=True,
         )
-        row = flatten_virtual_device_for_db(device)
-        _upsert_device_row(conn, row)
+        generator.save_device_to_db(device, conn)
 
     conn.commit()
     return _fetch_device_ids(conn, asic_model, devices_count)[:devices_count]
 
 
 def _fetch_open_tasks(
-    conn: sqlite3.Connection,
+    conn: Any,
     asic_model: str,
     target: OptimizationTarget,
     now_iso: str,
-) -> List[sqlite3.Row]:
+) -> List[Any]:
     return conn.execute(
         """
         SELECT task_id, device_id, ambient_level, query_budget, target, created_at, expires_at
@@ -198,7 +144,7 @@ def _fetch_open_tasks(
 
 
 def _insert_task(
-    conn: sqlite3.Connection,
+    conn: Any,
     task_id: str,
     device_id: str,
     asic_model: str,
@@ -231,7 +177,7 @@ def _insert_task(
 
 
 def _ensure_tasks(
-    conn: sqlite3.Connection,
+    conn: Any,
     asic_model: str,
     device_ids: List[str],
     query_budget: int,
@@ -254,7 +200,7 @@ def _ensure_tasks(
     conn.commit()
 
     open_rows = _fetch_open_tasks(conn, asic_model, target, now_iso)
-    existing: Dict[Tuple[str, str], sqlite3.Row] = {
+    existing: Dict[Tuple[str, str], Any] = {
         (r["device_id"], r["ambient_level"]): r for r in open_rows
     }
 
@@ -312,14 +258,13 @@ def generate_miner_task_bundle(
     Generate a full miner task bundle for a specific ASIC model.
     
     Behaviour:
-    - Uses SQLite as the source of truth for devices/tasks.
+    - Uses DB as the source of truth for devices/tasks.
     - Reuses up to `devices_count` existing devices from DB.
-    - If there are fewer than `devices_count`, imports from ./virtual_devices/*.json,
-      and if still missing, generates the remaining and persists them.
+    - If there are fewer than `devices_count`, generates the remaining devices and persists them.
     - Uses all 5 ambient environments (all AmbientTemperatureLevel values).
     - Each device has a task in each ambient environment (devices_count * 5 tasks).
     """
-    init_db(db_path)
+    init_db(str(db_path))
     generator = VirtualDeviceGenerator()
     generator.load_builtin_specifications()
 
@@ -327,8 +272,7 @@ def generate_miner_task_bundle(
         available = ", ".join(generator.get_available_models())
         raise ValueError(f"ASIC model '{asic_model}' not found. Available: {available}")
 
-    db_path = Path(db_path)
-    with connect(db_path) as conn:
+    with connect(str(db_path)) as conn:
         devices = _ensure_devices(conn, generator, asic_model, devices_count)
         tasks = _ensure_tasks(conn, asic_model, devices, query_budget, target, expires_in)
 
@@ -349,7 +293,7 @@ def main() -> None:
     """
     CLI entry point for generating a default task bundle (DB-only).
 
-    - Writes/updates devices and tasks in SQLite (data/validator.db).
+    - Writes/updates devices and tasks in DB (SQLite or PostgreSQL).
     - Does not write any JSON artifacts to disk.
     """
     bundle = generate_miner_task_bundle()

@@ -17,7 +17,6 @@ from typing import Dict, List, Optional, Tuple
 from enum import Enum
 import warnings
 from pathlib import Path
-import sqlite3
 
 # Import from virtual_device_generator
 from virtual_device_generator import (
@@ -149,7 +148,7 @@ class ASICPhysicsSimulator:
         
         Args:
             device_id: Unique identifier for the device
-            db_path: Path to SQLite DB. Devices are loaded from the `devices` table.
+                db_path: DB target (SQLite path or PostgreSQL URL). Devices are loaded from the `devices` table.
         """
         init_db(db_path)
         with connect(db_path) as conn:

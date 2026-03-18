@@ -12,10 +12,9 @@ Version: 1.0
 
 import json
 import random
-import sqlite3
 import uuid
 from dataclasses import dataclass, asdict
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 from version import DB_SCHEMA_VERSION, DEVICE_CREATOR_VERSION
 
@@ -209,15 +208,47 @@ class VirtualDeviceGenerator:
     # SQLite persistence helpers (DB is source of truth)
     # ------------------------------------------------------------------------
 
-    def save_device_to_db(self, device: VirtualDevice, conn: sqlite3.Connection) -> None:
+    def save_device_to_db(self, device: VirtualDevice, conn: Any) -> None:
         """
-        Persist a VirtualDevice into SQLite `devices` table (see init_db.py schema).
+        Persist a VirtualDevice into the `devices` table (see init_db.py schema).
         """
         row = flatten_virtual_device_for_db(device)
         # Ensure version tags are always set to current values
         row["creator_version"] = DEVICE_CREATOR_VERSION
         row["schema_version"] = DB_SCHEMA_VERSION
         row["is_active"] = 1
+        values = (
+            row["device_id"],
+            row["asic_model"],
+            row["electricity_price"],
+            row["created_at"],
+            row["creator_version"],
+            row["schema_version"],
+            row["is_active"],
+            row["silicon_quality"],
+            row["degradation"],
+            row["thermal_resistance"],
+            row["spec_name"],
+            row["spec_manufacturer"],
+            row["nominal_hashrate"],
+            row["nominal_power"],
+            row["hashrate_per_mhz"],
+            row["optimal_voltage"],
+            row["base_thermal_resistance"],
+            row["manufacturer_frequency"],
+            row["efficiency"],
+            row["C"],
+            row["min_frequency"],
+            row["max_frequency"],
+            row["min_voltage"],
+            row["max_voltage"],
+            row["max_safe_temperature"],
+            row["min_fan_speed"],
+            row["max_fan_speed"],
+            row["min_power"],
+            row["max_power"],
+            row["device_json"],
+        )
         conn.execute(
             """
             INSERT INTO devices (
@@ -230,14 +261,14 @@ class VirtualDeviceGenerator:
                 min_fan_speed, max_fan_speed, min_power, max_power,
                 device_json
             ) VALUES (
-                :device_id, :asic_model, :electricity_price, :created_at,
-                :creator_version, :schema_version, :is_active,
-                :silicon_quality, :degradation, :thermal_resistance,
-                :spec_name, :spec_manufacturer, :nominal_hashrate, :nominal_power, :hashrate_per_mhz,
-                :optimal_voltage, :base_thermal_resistance, :manufacturer_frequency, :efficiency, :C,
-                :min_frequency, :max_frequency, :min_voltage, :max_voltage, :max_safe_temperature,
-                :min_fan_speed, :max_fan_speed, :min_power, :max_power,
-                :device_json
+                ?, ?, ?, ?,
+                ?, ?, ?,
+                ?, ?, ?,
+                ?, ?, ?, ?, ?,
+                ?, ?, ?, ?, ?,
+                ?, ?, ?, ?, ?,
+                ?, ?, ?, ?,
+                ?
             )
             ON CONFLICT(device_id) DO UPDATE SET
                 asic_model=excluded.asic_model,
@@ -270,12 +301,12 @@ class VirtualDeviceGenerator:
                 max_power=excluded.max_power,
                 device_json=excluded.device_json
             """,
-            row,
+            values,
         )
 
-    def load_device_from_db(self, device_id: str, conn: sqlite3.Connection) -> VirtualDevice:
+    def load_device_from_db(self, device_id: str, conn: Any) -> VirtualDevice:
         """
-        Load a VirtualDevice from SQLite `devices` by device_id.
+        Load a VirtualDevice from `devices` by device_id.
         Uses device_json as canonical payload and also stores it in memory cache.
         """
         row = conn.execute(
@@ -289,7 +320,7 @@ class VirtualDeviceGenerator:
         self._devices[device.device_id] = device
         return device
 
-    def list_device_ids_from_db(self, asic_model: str, conn: sqlite3.Connection, limit: int) -> List[str]:
+    def list_device_ids_from_db(self, asic_model: str, conn: Any, limit: int) -> List[str]:
         rows = conn.execute(
             "SELECT device_id FROM devices WHERE asic_model = ? AND is_active = 1 ORDER BY created_at DESC LIMIT ?",
             (asic_model, limit),
@@ -299,12 +330,12 @@ class VirtualDeviceGenerator:
     def ensure_devices_in_db(
         self,
         asic_model: str,
-        conn: sqlite3.Connection,
+        conn: Any,
         count: int = 5,
         electricity_price: float = 0.05,
     ) -> List[str]:
         """
-        Ensure there are at least `count` valid devices for `asic_model` stored in SQLite.
+        Ensure there are at least `count` valid devices for `asic_model` stored in DB.
 
         - Reuses existing DB devices if possible.
         - Validates each candidate by parsing device_json into VirtualDevice.

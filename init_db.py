@@ -1,97 +1,177 @@
 """
-Initialize the validator SQLite database schema.
+Initialize the validator PostgreSQL database schema.
 
 Usage:
+  Set DATABASE_URL in .env or in the environment, then:
   python init_db.py
   python init_db.py --reset
 
-Creates/updates `data/validator.db` with the tables used by Task Manager.
+Requires DATABASE_URL (PostgreSQL URL). SQLite is not supported.
 """
 
 from __future__ import annotations
 
 import argparse
-import sqlite3
-from pathlib import Path
+import os
+
+from dotenv import load_dotenv
+
+load_dotenv()
+from typing import Any, Sequence
 
 from version import DB_SCHEMA_VERSION
 
 
-def default_db_path() -> Path:
-    return Path("data") / "validator.db"
+def _get_database_url() -> str:
+    url = os.getenv("DATABASE_URL", "").strip()
+    if not url:
+        raise RuntimeError(
+            "DATABASE_URL is not set. Set it to a PostgreSQL connection URL, e.g.:\n"
+            "  export DATABASE_URL='postgresql://user:password@localhost:5432/tensorclock'"
+        )
+    return url
 
 
-def connect(db_path: Path | str) -> sqlite3.Connection:
-    db_path = Path(db_path)
-    db_path.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(str(db_path))
-    conn.row_factory = sqlite3.Row
-    # Safety + reasonable performance for validator workload
-    conn.execute("PRAGMA foreign_keys = ON;")
-    conn.execute("PRAGMA journal_mode = WAL;")
-    conn.execute("PRAGMA synchronous = NORMAL;")
-    conn.execute("PRAGMA busy_timeout = 5000;")
-    return conn
+def default_db_path() -> str:
+    """Return the database URL from DATABASE_URL (required)."""
+    return _get_database_url()
 
 
-def init_db(db_path: Path | str = default_db_path()) -> None:
+def _is_postgres_url(target: str) -> bool:
+    return target.startswith("postgres://") or target.startswith("postgresql://")
+
+
+def _qmark_to_postgres_placeholders(query: str) -> str:
+    """Convert '?' placeholders to '%s' for psycopg."""
+    return query.replace("?", "%s")
+
+
+class DBConnection:
+    def __init__(self, raw: Any):
+        self._raw = raw
+
+    def execute(self, query: str, params: Sequence[Any] = ()) -> Any:
+        if params is None:
+            params = ()
+        query = _qmark_to_postgres_placeholders(query)
+        return self._raw.execute(query, params)
+
+    def commit(self) -> None:
+        self._raw.commit()
+
+    def rollback(self) -> None:
+        self._raw.rollback()
+
+    def close(self) -> None:
+        try:
+            self._raw.close()
+        except Exception:
+            pass
+
+    def __enter__(self) -> "DBConnection":
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        if exc_type is None:
+            try:
+                self._raw.commit()
+            except Exception:
+                pass
+        else:
+            try:
+                self._raw.rollback()
+            except Exception:
+                pass
+        self.close()
+
+
+def connect(db_url: str | None = None) -> DBConnection:
     """
-    Initialize SQLite schema for devices/tasks/assignments.
+    Create a PostgreSQL connection. Uses DATABASE_URL if db_url is None.
+    Returns a wrapper that converts '?' placeholders to '%s' and supports dict-like rows.
+    """
+    url = (db_url or os.getenv("DATABASE_URL", "")).strip()
+    if not url or not _is_postgres_url(url):
+        raise RuntimeError(
+            "A PostgreSQL URL is required (postgresql://...). "
+            "Set DATABASE_URL or pass --db postgresql://..."
+        )
+    import psycopg  # type: ignore
+    from psycopg.rows import dict_row  # type: ignore
+
+    raw = psycopg.connect(url, row_factory=dict_row)
+    return DBConnection(raw=raw)
+
+
+def init_db(db_url: str | None = None) -> None:
+    """
+    Initialize PostgreSQL schema for devices/tasks/assignments.
     Safe to call multiple times.
     """
-    db_path = Path(db_path)
-    with connect(db_path) as conn:
-        conn.executescript(
+    url = db_url or _get_database_url()
+    with connect(url) as conn:
+        # meta
+        conn.execute(
             """
             CREATE TABLE IF NOT EXISTS meta (
                 key TEXT PRIMARY KEY,
                 value TEXT NOT NULL
             );
+            """
+        )
 
+        # devices
+        conn.execute(
+            """
             CREATE TABLE IF NOT EXISTS devices (
                 device_id TEXT PRIMARY KEY,
                 asic_model TEXT NOT NULL,
-                electricity_price REAL NOT NULL,
+                electricity_price double precision NOT NULL,
                 created_at TEXT NOT NULL,
                 creator_version TEXT NOT NULL DEFAULT '0',
                 schema_version TEXT NOT NULL DEFAULT '0',
                 is_active INTEGER NOT NULL DEFAULT 1,
 
-                -- Hidden parameters
-                silicon_quality REAL NOT NULL,
-                degradation REAL NOT NULL,
-                thermal_resistance REAL NOT NULL,
+                silicon_quality double precision NOT NULL,
+                degradation double precision NOT NULL,
+                thermal_resistance double precision NOT NULL,
 
-                -- Base specification
                 spec_name TEXT NOT NULL,
                 spec_manufacturer TEXT NOT NULL,
-                nominal_hashrate REAL NOT NULL,
-                nominal_power REAL NOT NULL,
-                hashrate_per_mhz REAL NOT NULL,
-                optimal_voltage REAL NOT NULL,
-                base_thermal_resistance REAL NOT NULL,
-                manufacturer_frequency REAL NOT NULL,
-                efficiency REAL NOT NULL,
-                C REAL NOT NULL,
+                nominal_hashrate double precision NOT NULL,
+                nominal_power double precision NOT NULL,
+                hashrate_per_mhz double precision NOT NULL,
+                optimal_voltage double precision NOT NULL,
+                base_thermal_resistance double precision NOT NULL,
+                manufacturer_frequency double precision NOT NULL,
+                efficiency double precision NOT NULL,
+                C double precision NOT NULL,
 
-                -- Hardware limits
-                min_frequency REAL NOT NULL,
-                max_frequency REAL NOT NULL,
-                min_voltage REAL NOT NULL,
-                max_voltage REAL NOT NULL,
-                max_safe_temperature REAL NOT NULL,
-                min_fan_speed REAL NOT NULL,
-                max_fan_speed REAL NOT NULL,
-                min_power REAL NOT NULL,
-                max_power REAL NOT NULL,
+                min_frequency double precision NOT NULL,
+                max_frequency double precision NOT NULL,
+                min_voltage double precision NOT NULL,
+                max_voltage double precision NOT NULL,
+                max_safe_temperature double precision NOT NULL,
+                min_fan_speed double precision NOT NULL,
+                max_fan_speed double precision NOT NULL,
+                min_power double precision NOT NULL,
+                max_power double precision NOT NULL,
 
-                -- Full JSON snapshot for forward compatibility
                 device_json TEXT NOT NULL
             );
+            """
+        )
 
+        conn.execute(
+            """
             CREATE INDEX IF NOT EXISTS idx_devices_model_created
             ON devices (asic_model, created_at);
+            """
+        )
 
+        # tasks
+        conn.execute(
+            """
             CREATE TABLE IF NOT EXISTS tasks (
                 task_id TEXT PRIMARY KEY,
                 device_id TEXT NOT NULL,
@@ -106,10 +186,19 @@ def init_db(db_path: Path | str = default_db_path()) -> None:
                 schema_version TEXT NOT NULL DEFAULT '0',
                 FOREIGN KEY(device_id) REFERENCES devices(device_id) ON DELETE CASCADE
             );
+            """
+        )
 
+        conn.execute(
+            """
             CREATE INDEX IF NOT EXISTS idx_tasks_lookup
             ON tasks (asic_model, status, expires_at);
+            """
+        )
 
+        # assignments
+        conn.execute(
+            """
             CREATE TABLE IF NOT EXISTS assignments (
                 task_id TEXT NOT NULL,
                 miner_uid INTEGER NOT NULL,
@@ -121,16 +210,28 @@ def init_db(db_path: Path | str = default_db_path()) -> None:
                 PRIMARY KEY (task_id, miner_uid),
                 FOREIGN KEY(task_id) REFERENCES tasks(task_id) ON DELETE CASCADE
             );
+            """
+        )
 
+        conn.execute(
+            """
             CREATE INDEX IF NOT EXISTS idx_assignments_miner
             ON assignments (miner_uid, state);
             """
         )
 
-        # Lightweight migrations for existing DBs (add columns if missing)
+        # Migrations: add columns if missing
         def _ensure_column(table: str, column: str, decl: str) -> None:
-            cols = {r["name"] for r in conn.execute(f"PRAGMA table_info({table})").fetchall()}
-            if column not in cols:
+            exists = conn.execute(
+                """
+                SELECT 1
+                FROM information_schema.columns
+                WHERE table_name = %s AND column_name = %s
+                """,
+                (table, column),
+            ).fetchone()
+            if not exists:
+                # PostgreSQL ADD COLUMN syntax
                 conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
 
         _ensure_column("devices", "creator_version", "TEXT NOT NULL DEFAULT '0'")
@@ -139,36 +240,63 @@ def init_db(db_path: Path | str = default_db_path()) -> None:
         _ensure_column("tasks", "creator_version", "TEXT NOT NULL DEFAULT '0'")
         _ensure_column("tasks", "schema_version", "TEXT NOT NULL DEFAULT '0'")
 
-        # Persist current schema version in meta table
+        # Persist schema version
         conn.execute(
-            "INSERT INTO meta(key, value) VALUES('db_schema_version', ?) "
-            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            """
+            INSERT INTO meta(key, value)
+            VALUES('db_schema_version', %s)
+            ON CONFLICT(key) DO UPDATE SET value = EXCLUDED.value
+            """,
             (DB_SCHEMA_VERSION,),
         )
 
 
-def reset_db(db_path: Path | str = default_db_path()) -> None:
+def reset_db(db_url: str | None = None) -> None:
     """
-    Delete the SQLite database file (and WAL/SHM sidecars) to recreate schema from scratch.
+    Drop all managed tables and leave DB empty.
+    Call init_db() after to recreate schema.
     """
-    db_path = Path(db_path)
-    for p in (db_path, db_path.with_suffix(db_path.suffix + "-wal"), db_path.with_suffix(db_path.suffix + "-shm")):
-        if p.exists():
-            p.unlink()
+    url = db_url or _get_database_url()
+    if not _is_postgres_url(url):
+        raise RuntimeError("reset_db requires a PostgreSQL URL (DATABASE_URL or --db).")
+    with connect(url) as conn:
+        conn.execute("DROP TABLE IF EXISTS assignments CASCADE")
+        conn.execute("DROP TABLE IF EXISTS tasks CASCADE")
+        conn.execute("DROP TABLE IF EXISTS devices CASCADE")
+        conn.execute("DROP TABLE IF EXISTS meta CASCADE")
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--reset", action="store_true", help="Delete existing DB and recreate schema")
-    parser.add_argument("--db", type=str, default=str(default_db_path()), help="Path to SQLite DB")
+    parser = argparse.ArgumentParser(
+        description="Initialize or reset TensorClock PostgreSQL schema."
+    )
+    parser.add_argument(
+        "--reset",
+        action="store_true",
+        help="Drop managed tables first, then create schema.",
+    )
+    parser.add_argument(
+        "--db",
+        type=str,
+        default=None,
+        help="PostgreSQL URL (default: use DATABASE_URL from env).",
+    )
     args = parser.parse_args()
 
+    db_url = args.db or os.getenv("DATABASE_URL", "").strip()
+    if not db_url:
+        parser.error("DATABASE_URL is not set and --db was not given.")
+    if not _is_postgres_url(db_url):
+        parser.error("Database URL must be postgresql://... or postgres://...")
+
     if args.reset:
-        reset_db(args.db)
-    init_db(args.db)
-    print(f"[OK] Initialized DB at {Path(args.db)}")
+        reset_db(db_url)
+    init_db(db_url)
+
+    # Mask password in display
+    display = db_url.split("@")[-1] if "@" in db_url else db_url
+    print(f"[OK] Initialized DB at {display}")
 
 
 if __name__ == "__main__":
     main()
-

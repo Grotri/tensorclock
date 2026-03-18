@@ -1,2 +1,4 @@
 bittensor>=10.0.1
 PyYAML>=6.0
+psycopg[binary]>=3
+python-dotenv>=1.0

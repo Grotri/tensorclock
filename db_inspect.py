@@ -1,5 +1,5 @@
 """
-SQLite inspection utility for TensorClock validator DB.
+DB inspection utility for TensorClock validator DB.
 
 Prints a human-friendly summary of:
 - devices (counts by asic_model, sample rows)
@@ -8,7 +8,7 @@ Prints a human-friendly summary of:
 
 Usage:
   python db_inspect.py
-  python db_inspect.py --db data/validator.db
+  python db_inspect.py --db postgresql://localhost/tensorclock
   python db_inspect.py --limit 10
   python db_inspect.py --json
 """
@@ -17,12 +17,13 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from init_db import connect, default_db_path, init_db
+from init_db import connect, init_db
 from version import DB_SCHEMA_VERSION, DEVICE_CREATOR_VERSION, TASK_CREATOR_VERSION
 
 
@@ -41,9 +42,8 @@ def _print_kv(title: str, rows: List[Dict[str, Any]]) -> None:
 
 
 def _fetchall_dict(conn, sql: str, params: tuple = ()) -> List[Dict[str, Any]]:
-    cur = conn.execute(sql, params)
-    cols = [d[0] for d in cur.description]
-    return [dict(zip(cols, row)) for row in cur.fetchall()]
+    rows = conn.execute(sql, params).fetchall()
+    return list(rows) if rows else []
 
 
 @dataclass
@@ -70,10 +70,10 @@ class DbSummary:
 def inspect_db(db_path: str, limit: int = 5) -> DbSummary:
     init_db(db_path)
     with connect(db_path) as conn:
-        devices_total = conn.execute("SELECT COUNT(*) FROM devices").fetchone()[0]
-        devices_inactive = conn.execute("SELECT COUNT(*) FROM devices WHERE is_active = 0").fetchone()[0]
-        tasks_total = conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
-        assignments_total = conn.execute("SELECT COUNT(*) FROM assignments").fetchone()[0]
+        devices_total = conn.execute("SELECT COUNT(*) AS n FROM devices").fetchone()["n"]
+        devices_inactive = conn.execute("SELECT COUNT(*) AS n FROM devices WHERE is_active = 0").fetchone()["n"]
+        tasks_total = conn.execute("SELECT COUNT(*) AS n FROM tasks").fetchone()["n"]
+        assignments_total = conn.execute("SELECT COUNT(*) AS n FROM assignments").fetchone()["n"]
 
         devices_by_model = _fetchall_dict(
             conn,
@@ -125,12 +125,12 @@ def inspect_db(db_path: str, limit: int = 5) -> DbSummary:
 
         now = _now_iso()
         tasks_expired_open = conn.execute(
-            "SELECT COUNT(*) FROM tasks WHERE status='open' AND expires_at <= ?",
+            "SELECT COUNT(*) AS n FROM tasks WHERE status='open' AND expires_at <= ?",
             (now,),
-        ).fetchone()[0]
+        ).fetchone()["n"]
         tasks_superseded = conn.execute(
-            "SELECT COUNT(*) FROM tasks WHERE status='superseded'",
-        ).fetchone()[0]
+            "SELECT COUNT(*) AS n FROM tasks WHERE status='superseded'",
+        ).fetchone()["n"]
 
         tasks_by_creator_version = _fetchall_dict(
             conn,
@@ -199,12 +199,14 @@ def inspect_db(db_path: str, limit: int = 5) -> DbSummary:
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--db", type=str, default=str(default_db_path()), help="Path to SQLite DB")
+    parser.add_argument("--db", type=str, default=None, help="PostgreSQL URL (default: DATABASE_URL)")
     parser.add_argument("--limit", type=int, default=5, help="How many sample rows to show")
     parser.add_argument("--json", action="store_true", help="Print as JSON instead of text")
     args = parser.parse_args()
 
-    db_path = args.db
+    db_path = args.db or os.environ.get("DATABASE_URL", "")
+    if not db_path:
+        parser.error("DATABASE_URL is not set and --db was not given.")
     summary = inspect_db(db_path=db_path, limit=args.limit)
 
     if args.json:
@@ -214,7 +216,7 @@ def main() -> None:
     print("=" * 72)
     print("TensorClock DB Inspect")
     print("=" * 72)
-    print(f"DB: {Path(summary.db_path)}")
+    print(f"DB: {summary.db_path}")
     print(f"Now: {summary.now}")
     print(f"Expected versions: schema={DB_SCHEMA_VERSION}, device={DEVICE_CREATOR_VERSION}, task={TASK_CREATOR_VERSION}")
     print()

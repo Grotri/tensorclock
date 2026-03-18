@@ -465,7 +465,7 @@ def main():
     # Load a device
     print_section("Loading Virtual Device")
 
-    # DB-only: ensure at least one S19 device exists in SQLite and load it
+    # DB-only: ensure at least one S19 device exists and load it
     db_path = str(default_db_path())
     init_db(db_path)
     generator = VirtualDeviceGenerator()
