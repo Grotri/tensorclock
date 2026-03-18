@@ -1,0 +1,5 @@
+__pycache__/
+output/
+virtual_devices/
+data/
+tasks.json
