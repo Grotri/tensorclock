@@ -17,6 +17,7 @@ from typing import Dict, List, Optional, Tuple
 from enum import Enum
 import warnings
 from pathlib import Path
+import sqlite3
 
 # Import from virtual_device_generator
 from virtual_device_generator import (
@@ -26,6 +27,8 @@ from virtual_device_generator import (
     ASICModelSpecification,
     VirtualDeviceGenerator
 )
+
+from init_db import init_db, connect, default_db_path
 
 
 class AmbientTemperatureLevel(Enum):
@@ -140,32 +143,17 @@ class ASICPhysicsSimulator:
         # Above nominal frequency: voltage multiplier
         self._fv_coef_above = 2.5
 
-    def load_device(self, device_id: str, device_path: Optional[str] = None) -> None:
+    def load_device(self, device_id: str, db_path: str = str(default_db_path())) -> None:
         """
         Load a virtual device into the simulator.
         
         Args:
             device_id: Unique identifier for the device
-            device_path: Optional path to device file. If None, searches in virtual_devices/
+            db_path: Path to SQLite DB. Devices are loaded from the `devices` table.
         """
-        if device_path:
-            self.device = self.device_generator.load_device(device_path)
-        else:
-            # Try to load from virtual_devices directory (prioritize JSON for compatibility)
-            possible_paths = [
-                f"virtual_devices/{device_id}.json",
-                f"virtual_devices/{device_id}.pkl",
-            ]
-            
-            for path in possible_paths:
-                try:
-                    self.device = self.device_generator.load_device(path)
-                    break
-                except FileNotFoundError:
-                    continue
-            
-            if self.device is None:
-                raise FileNotFoundError(f"Device '{device_id}' not found in virtual_devices/")
+        init_db(db_path)
+        with connect(db_path) as conn:
+            self.device = self.device_generator.load_device_from_db(device_id, conn)
         
         # Validate device model
         if self.device.asic_model != "Antminer S19 Pro":

@@ -1,188 +1,149 @@
-import argparse
+"""
+Simplest possible Bittensor subnet validator. Simply burns everything to UID 0.
+"""
+
 import os
-import random
 import time
-import traceback
+import click
+import logging
+import bittensor as bt
+from bittensor_wallet import Wallet
+import threading
+import sys
 
-from bittensor import Subtensor, Wallet, Config, Dendrite
-from bittensor.utils.btlogging import logging
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+logger = logging.getLogger(__name__)
 
-from protocol import Dummy
+HEARTBEAT_TIMEOUT = 600  # seconds
 
+def heartbeat_monitor(last_heartbeat, stop_event):
+    while not stop_event.is_set():
+        time.sleep(5)
+        if time.time() - last_heartbeat[0] > HEARTBEAT_TIMEOUT:
+            logger.error("No heartbeat detected in the last 600 seconds. Restarting process.")
+            logging.shutdown(); os.execv(sys.executable, [sys.executable] + sys.argv)
 
-class Validator:
-    def __init__(self):
-        self.config = self.get_config()
-        self.setup_logging()
-        self.setup_bittensor_objects()
-        self.my_uid = self.metagraph.hotkeys.index(self.wallet.hotkey.ss58_address)
-        self.scores = [1.0] * len(self.metagraph.S)
-        self.last_update = self.subtensor.blocks_since_last_update(
-            self.config.netuid, self.my_uid
-        )
-        self.tempo = self.subtensor.tempo(self.config.netuid)
-        self.moving_avg_scores = [1.0] * len(self.metagraph.S)
-        self.alpha = 0.1
+@click.command()
+@click.option(
+    "--network",
+    default=lambda: os.getenv("NETWORK", "finney"),
+    help="Network to connect to (finney, test, local)",
+)
+@click.option(
+    "--netuid",
+    type=int,
+    default=lambda: int(os.getenv("NETUID", "1")),
+    help="Subnet netuid",
+)
+@click.option(
+    "--coldkey",
+    default=lambda: os.getenv("WALLET_NAME", "default"),
+    help="Wallet name",
+)
+@click.option(
+    "--hotkey",
+    default=lambda: os.getenv("HOTKEY_NAME", "default"),
+    help="Hotkey name",
+)
+@click.option(
+    "--log-level",
+    type=click.Choice(["DEBUG", "INFO", "WARNING", "ERROR"], case_sensitive=False),
+    default=lambda: os.getenv("LOG_LEVEL", "INFO"),
+    help="Logging level",
+)
+def main(network: str, netuid: int, coldkey: str, hotkey: str, log_level: str):
+    """Run the Chi subnet validator."""
+    # Set log level
+    logging.getLogger().setLevel(getattr(logging, log_level.upper()))
+    logger.info(f"Starting validator on network={network}, netuid={netuid}")
 
-    def get_config(self):
-        # Set up the configuration parser.
-        parser = argparse.ArgumentParser()
-        # TODO: Add your custom validator arguments to the parser.
-        parser.add_argument(
-            "--custom",
-            default="my_custom_value",
-            help="Adds a custom value to the parser.",
-        )
-        # Adds override arguments for network and netuid.
-        parser.add_argument(
-            "--netuid", type=int, default=1, help="The chain subnet uid."
-        )
-        # Adds subtensor specific arguments.
-        Subtensor.add_args(parser)
-        # Adds logging specific arguments.
-        logging.add_args(parser)
-        # Adds wallet specific arguments.
-        Wallet.add_args(parser)
-        # Parse the config.
-        config = Config(parser)
-        # Set up logging directory.
-        config.full_path = os.path.expanduser(
-            "{}/{}/{}/netuid{}/validator".format(
-                config.logging.logging_dir,
-                config.wallet.name,
-                config.wallet.hotkey,
-                config.netuid,
-            )
-        )
-        # Ensure the logging directory exists.
-        os.makedirs(config.full_path, exist_ok=True)
-        return config
+    # Heartbeat setup
+    last_heartbeat = [time.time()]
+    stop_event = threading.Event()
+    heartbeat_thread = threading.Thread(target=heartbeat_monitor, args=(last_heartbeat, stop_event), daemon=True)
+    heartbeat_thread.start()
 
-    def setup_logging(self):
-        # Set up logging.
-        logging(config=self.config, logging_dir=self.config.full_path)
-        logging.info(
-            f"Running validator for subnet: {self.config.netuid} on network: {self.config.subtensor.network} with config:"
-        )
-        logging.info(self.config)
+    try:
+        # Initialize wallet, subtensor, and metagraph
+        wallet = Wallet(name=coldkey, hotkey=hotkey)
+        subtensor = bt.Subtensor(network=network)
+        metagraph = bt.Metagraph(netuid=netuid, network=network)
 
-    def setup_bittensor_objects(self):
-        # Build Bittensor validator objects.
-        logging.info("Setting up Bittensor objects.")
+        # Sync metagraph
+        metagraph.sync(subtensor=subtensor)
+        logger.info(f"Metagraph synced: {metagraph.n} neurons at block {metagraph.block}")
 
-        # Initialize wallet.
-        self.wallet = Wallet(config=self.config)
-        logging.info(f"Wallet: {self.wallet}")
+        # Get our UID
+        my_hotkey = wallet.hotkey.ss58_address
+        if my_hotkey not in metagraph.hotkeys:
+            logger.error(f"Hotkey {my_hotkey} not registered on netuid {netuid}")
+            stop_event.set()
+            return
+        my_uid = metagraph.hotkeys.index(my_hotkey)
+        logger.info(f"Validator UID: {my_uid}")
 
-        # Initialize subtensor.
-        self.subtensor = Subtensor(config=self.config)
-        logging.info(f"Subtensor: {self.subtensor}")
+        # Get tempo for this subnet
+        tempo = subtensor.get_subnet_hyperparameters(netuid).tempo
+        logger.info(f"Subnet tempo: {tempo} blocks")
 
-        # Initialize dendrite.
-        self.dendrite = Dendrite(wallet=self.wallet)
-        logging.info(f"Dendrite: {self.dendrite}")
+        last_weight_block = 0
 
-        # Initialize metagraph.
-        self.metagraph = self.subtensor.metagraph(netuid=self.config.netuid)
-        logging.info(f"Metagraph: {self.metagraph}")
-
-        # Connect the validator to the network.
-        if self.wallet.hotkey.ss58_address not in self.metagraph.hotkeys:
-            logging.error(
-                f"Your validator: {self.wallet} is not registered to chain connection: {self.subtensor} \nRun 'btcli register' and try again."
-            )
-            exit()
-        else:
-            # Each validator gets a unique identity (UID) in the network.
-            self.my_subnet_uid = self.metagraph.hotkeys.index(
-                self.wallet.hotkey.ss58_address
-            )
-            logging.info(f"Running validator on uid: {self.my_subnet_uid}")
-
-        # Set up initial scoring weights for validation.
-        logging.info("Building validation weights.")
-        self.scores = [1.0] * len(self.metagraph.S)
-        logging.info(f"Weights: {self.scores}")
-
-    def run(self):
-        # The Main Validation Loop.
-        logging.info("Starting validator loop.")
+        # Main validator loop
         while True:
             try:
-                # time.sleep(int(self.subtensor.tempo(self.config.netuid) * 0.25))
-                # Create a synapse with the current step value.
-                synapse = Dummy(dummy_input=random.randint(0, 100))
+                # Sync metagraph
+                metagraph.sync(subtensor=subtensor)
+                current_block = subtensor.get_current_block()
 
-                # Broadcast a query to all miners on the network.
-                responses = self.dendrite.query(
-                    axons=self.metagraph.axons, synapse=synapse, timeout=12
-                )
-                logging.info(f"sending input {synapse.dummy_input}")
-                if responses:
-                    responses = [
-                        response.dummy_output
-                        for response in responses
-                        if response is not None
-                    ]
+                # Heartbeat: update the last heartbeat timestamp
+                last_heartbeat[0] = time.time()
 
-                # Log the results.
-                logging.info(f"Received dummy responses: {responses}")
+                # Check if we should set weights (once per tempo)
+                blocks_since_last = current_block - last_weight_block
+                if blocks_since_last >= tempo:
+                    logger.info(f"Block {current_block}: Setting weights (tempo={tempo})")
 
-                # Adjust the length of moving_avg_scores to match the number of responses
-                if len(self.moving_avg_scores) < len(responses):
-                    self.moving_avg_scores.extend(
-                        [1] * (len(responses) - len(self.moving_avg_scores))
+                    # Set 100% weight on UID 0
+                    uids = [0]
+                    weights = [1.0]
+
+                    # Set weights on chain
+                    success = subtensor.set_weights(
+                        wallet=wallet,
+                        netuid=netuid,
+                        uids=uids,
+                        weights=weights,
+                        wait_for_inclusion=True,
+                        wait_for_finalization=False,
                     )
 
-                # Adjust the scores based on responses from miners and update moving average.
-                for i, resp_i in enumerate(responses):
-                    current_score = 1 if resp_i == synapse.dummy_input * 2 else 0
-                    self.moving_avg_scores[i] = (
-                        1 - self.alpha
-                    ) * self.moving_avg_scores[i] + self.alpha * current_score
-
-                logging.info(f"Moving Average Scores: {self.moving_avg_scores}")
-                self.last_update = self.subtensor.blocks_since_last_update(
-                    self.config.netuid, self.my_uid
-                )
-
-                # set weights once every tempo
-                total = sum(self.moving_avg_scores)
-                weights = [score / total for score in self.moving_avg_scores]
-                logging.info(f"[blue]Setting weights: {weights}[/blue]")
-                # Update the incentive mechanism on the Bittensor blockchain.
-                response = self.subtensor.set_weights(
-                    wallet=self.wallet,
-                    netuid=self.config.netuid,
-                    uids=self.metagraph.uids,
-                    weights=weights,
-                    wait_for_inclusion=True,
-                    period=self.tempo,  # Good for fast blocks - otherwise make sure to set proper period or remove this argument completely
-                )
-                if response.success:
-                    logging.success(
-                        f"Weights set successfully. Fee: {response.extrinsic_fee}"
-                    )
+                    if success:
+                        logger.info(f"Successfully set weights for {len(uids)} neurons")
+                        last_weight_block = current_block
+                    else:
+                        logger.warning("Failed to set weights")
                 else:
-                    logging.error(
-                        f"Failed to set weights: {response.error} - {response.message}"
+                    logger.debug(
+                        f"Block {current_block}: Waiting for tempo "
+                        f"({blocks_since_last}/{tempo} blocks)"
                     )
-                self.metagraph.sync()
-                # sleep until next tempo
-                time.sleep(
-                    (((self.subtensor.block // self.tempo) + 1) * self.tempo) + 1
-                )
 
-            except RuntimeError as e:
-                logging.error(e)
-                traceback.print_exc()
+                # Sleep for ~1 block
+                time.sleep(12)
 
             except KeyboardInterrupt:
-                logging.success("Keyboard interrupt detected. Exiting validator.")
-                exit()
+                logger.info("Validator stopped by user")
+                break
+            except Exception as e:
+                logger.error(f"Error in validator loop: {e}")
+                time.sleep(12)
+    finally:
+        stop_event.set()
+        heartbeat_thread.join(timeout=2)
 
-
-# Run the validator.
 if __name__ == "__main__":
-    validator = Validator()
-    validator.run()
+    main()

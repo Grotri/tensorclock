@@ -3,7 +3,7 @@ Virtual Device Generator Module for TensorClock
 
 This module creates virtual ASIC devices with hidden parameters based on provided
 research data. It supports loading ASIC specifications from external files or
-variables, and enables local saving of virtual devices for reproducible testing.
+variables, and enables persistence of virtual devices for reproducible testing.
 
 Author: Senior Python Developer
 Date: 2026-03-10
@@ -11,21 +11,11 @@ Version: 1.0
 """
 
 import json
-import pickle
 import random
-from dataclasses import dataclass, asdict
-from typing import Dict, List, Optional, Union
-from pathlib import Path
-from enum import Enum
+import sqlite3
 import uuid
-
-# Optional YAML support
-try:
-    import yaml
-    YAML_AVAILABLE = True
-except ImportError:
-    YAML_AVAILABLE = False
-
+from dataclasses import dataclass, asdict
+from typing import Dict, List, Optional
 
 @dataclass
 class HiddenParameters:
@@ -202,29 +192,166 @@ class VirtualDeviceGenerator:
     It does NOT generate parameter values independently - all values must come from
     the provided research data or specifications.
     
-    Usage:
-        # Load specifications from file
+    Usage (DB-only):
         generator = VirtualDeviceGenerator()
-        generator.load_specifications_from_file('asic_models.json')
-        
-        # Generate a virtual device
-        device = generator.generate_device(
-            model_name="Antminer S19 Pro",
-            hidden_params={
-                'silicon_quality': 1.02,
-                'degradation': 0.05,
-                'thermal_resistance': 0.15
-            }
-        )
-        
-        # Save device locally
-        generator.save_device(device, 'device_001.pkl')
+        generator.load_builtin_specifications()
+        # Generate and persist a device to SQLite via save_device_to_db(...)
     """
     
     def __init__(self):
         """Initialize the Virtual Device Generator."""
         self._asic_models: Dict[str, ASICModelSpecification] = {}
         self._devices: Dict[str, VirtualDevice] = {}
+
+    # ------------------------------------------------------------------------
+    # SQLite persistence helpers (DB is source of truth)
+    # ------------------------------------------------------------------------
+
+    def save_device_to_db(self, device: VirtualDevice, conn: sqlite3.Connection) -> None:
+        """
+        Persist a VirtualDevice into SQLite `devices` table (see init_db.py schema).
+        """
+        row = flatten_virtual_device_for_db(device)
+        conn.execute(
+            """
+            INSERT INTO devices (
+                device_id, asic_model, electricity_price, created_at,
+                silicon_quality, degradation, thermal_resistance,
+                spec_name, spec_manufacturer, nominal_hashrate, nominal_power, hashrate_per_mhz,
+                optimal_voltage, base_thermal_resistance, manufacturer_frequency, efficiency, C,
+                min_frequency, max_frequency, min_voltage, max_voltage, max_safe_temperature,
+                min_fan_speed, max_fan_speed, min_power, max_power,
+                device_json
+            ) VALUES (
+                :device_id, :asic_model, :electricity_price, :created_at,
+                :silicon_quality, :degradation, :thermal_resistance,
+                :spec_name, :spec_manufacturer, :nominal_hashrate, :nominal_power, :hashrate_per_mhz,
+                :optimal_voltage, :base_thermal_resistance, :manufacturer_frequency, :efficiency, :C,
+                :min_frequency, :max_frequency, :min_voltage, :max_voltage, :max_safe_temperature,
+                :min_fan_speed, :max_fan_speed, :min_power, :max_power,
+                :device_json
+            )
+            ON CONFLICT(device_id) DO UPDATE SET
+                asic_model=excluded.asic_model,
+                electricity_price=excluded.electricity_price,
+                created_at=excluded.created_at,
+                silicon_quality=excluded.silicon_quality,
+                degradation=excluded.degradation,
+                thermal_resistance=excluded.thermal_resistance,
+                spec_name=excluded.spec_name,
+                spec_manufacturer=excluded.spec_manufacturer,
+                nominal_hashrate=excluded.nominal_hashrate,
+                nominal_power=excluded.nominal_power,
+                hashrate_per_mhz=excluded.hashrate_per_mhz,
+                optimal_voltage=excluded.optimal_voltage,
+                base_thermal_resistance=excluded.base_thermal_resistance,
+                manufacturer_frequency=excluded.manufacturer_frequency,
+                efficiency=excluded.efficiency,
+                C=excluded.C,
+                min_frequency=excluded.min_frequency,
+                max_frequency=excluded.max_frequency,
+                min_voltage=excluded.min_voltage,
+                max_voltage=excluded.max_voltage,
+                max_safe_temperature=excluded.max_safe_temperature,
+                min_fan_speed=excluded.min_fan_speed,
+                max_fan_speed=excluded.max_fan_speed,
+                min_power=excluded.min_power,
+                max_power=excluded.max_power,
+                device_json=excluded.device_json
+            """,
+            row,
+        )
+
+    def load_device_from_db(self, device_id: str, conn: sqlite3.Connection) -> VirtualDevice:
+        """
+        Load a VirtualDevice from SQLite `devices` by device_id.
+        Uses device_json as canonical payload and also stores it in memory cache.
+        """
+        row = conn.execute(
+            "SELECT device_json FROM devices WHERE device_id = ?",
+            (device_id,),
+        ).fetchone()
+        if row is None:
+            raise FileNotFoundError(f"Device '{device_id}' not found in DB")
+        payload = json.loads(row["device_json"])
+        device = VirtualDevice.from_dict(payload)
+        self._devices[device.device_id] = device
+        return device
+
+    def list_device_ids_from_db(self, asic_model: str, conn: sqlite3.Connection, limit: int) -> List[str]:
+        rows = conn.execute(
+            "SELECT device_id FROM devices WHERE asic_model = ? ORDER BY created_at DESC LIMIT ?",
+            (asic_model, limit),
+        ).fetchall()
+        return [r["device_id"] for r in rows]
+
+    def ensure_devices_in_db(
+        self,
+        asic_model: str,
+        conn: sqlite3.Connection,
+        count: int = 5,
+        electricity_price: float = 0.05,
+    ) -> List[str]:
+        """
+        Ensure there are at least `count` valid devices for `asic_model` stored in SQLite.
+
+        - Reuses existing DB devices if possible.
+        - Validates each candidate by parsing device_json into VirtualDevice.
+        - If a row is malformed, deletes it and replaces with a newly generated device.
+
+        Returns: list of device_ids (newest-first) of length `count`.
+        """
+        if asic_model not in self._asic_models:
+            available = ", ".join(self.get_available_models())
+            raise ValueError(f"ASIC model '{asic_model}' not loaded. Available: {available}")
+
+        def is_valid(device_json: str) -> bool:
+            try:
+                payload = json.loads(device_json)
+                device = VirtualDevice.from_dict(payload)
+                return device.asic_model == asic_model and bool(device.device_id)
+            except Exception:
+                return False
+
+        # Start with newest candidates
+        candidates = conn.execute(
+            "SELECT device_id, device_json FROM devices WHERE asic_model = ? ORDER BY created_at DESC",
+            (asic_model,),
+        ).fetchall()
+
+        valid_ids: List[str] = []
+        invalid_ids: List[str] = []
+        for r in candidates:
+            if len(valid_ids) >= count:
+                break
+            if is_valid(r["device_json"]):
+                valid_ids.append(r["device_id"])
+            else:
+                invalid_ids.append(r["device_id"])
+
+        # Delete invalid rows we encountered (best-effort cleanup)
+        for device_id in invalid_ids:
+            conn.execute("DELETE FROM devices WHERE device_id = ?", (device_id,))
+
+        # Generate missing devices
+        missing = max(0, count - len(valid_ids))
+        for _ in range(missing):
+            base_tr = self._asic_models[asic_model].base_thermal_resistance
+            device = self.generate_device(
+                model_name=asic_model,
+                hidden_params={
+                    "silicon_quality": 1.0,
+                    "degradation": 0.0,
+                    "thermal_resistance": base_tr,
+                },
+                electricity_price=electricity_price,
+                apply_thermal_resistance_spread=True,
+            )
+            self.save_device_to_db(device, conn)
+            valid_ids.append(device.device_id)
+
+        conn.commit()
+        return valid_ids[:count]
     
     def load_specifications_from_dict(self, specifications: Dict) -> None:
         """
@@ -244,38 +371,7 @@ class VirtualDeviceGenerator:
             except Exception as e:
                 raise ValueError(f"Invalid specification for model '{model_name}': {e}")
     
-    def load_specifications_from_file(self, filepath: Union[str, Path]) -> None:
-        """
-        Load ASIC model specifications from an external file.
-        
-        Supports JSON and YAML formats.
-        
-        Args:
-            filepath: Path to the specification file.
-        
-        Raises:
-            FileNotFoundError: If file does not exist
-            ValueError: If file format is unsupported or specification is invalid
-        """
-        filepath = Path(filepath)
-        
-        if not filepath.exists():
-            raise FileNotFoundError(f"Specification file not found: {filepath}")
-        
-        # Determine file format and load accordingly
-        if filepath.suffix.lower() in ['.json']:
-            with open(filepath, 'r', encoding='utf-8') as f:
-                specifications = json.load(f)
-        elif filepath.suffix.lower() in ['.yaml', '.yml']:
-            if not YAML_AVAILABLE:
-                raise ValueError("YAML support not available. Install PyYAML or use JSON format.")
-            with open(filepath, 'r', encoding='utf-8') as f:
-                specifications = yaml.safe_load(f)
-        else:
-            raise ValueError(f"Unsupported file format: {filepath.suffix}. Use .json, .yaml, or .yml")
-        
-        # Load specifications
-        self.load_specifications_from_dict(specifications)
+    # File-based specification loading removed (DB-only design).
     
     def add_model(self, model: ASICModelSpecification) -> None:
         """
@@ -425,162 +521,7 @@ class VirtualDeviceGenerator:
         """
         return list(self._devices.keys())
     
-    def save_device(
-        self,
-        device: VirtualDevice,
-        filepath: Union[str, Path],
-        format: str = 'pickle'
-    ) -> None:
-        """
-        Save a virtual device to a local file for reproducible testing.
-        
-        Args:
-            device: VirtualDevice object to save
-            filepath: Path where to save the device
-            format: Save format - 'pickle', 'json', or 'yaml'
-        
-        Raises:
-            ValueError: If format is unsupported
-        """
-        filepath = Path(filepath)
-        filepath.parent.mkdir(parents=True, exist_ok=True)
-        
-        if format == 'pickle':
-            with open(filepath, 'wb') as f:
-                pickle.dump(device, f)
-        elif format == 'json':
-            with open(filepath, 'w', encoding='utf-8') as f:
-                json.dump(device.to_dict(), f, indent=2)
-        elif format == 'yaml':
-            with open(filepath, 'w', encoding='utf-8') as f:
-                yaml.dump(device.to_dict(), f, default_flow_style=False)
-        else:
-            raise ValueError(f"Unsupported format: {format}. Use 'pickle', 'json', or 'yaml'")
-    
-    def load_device(
-        self,
-        filepath: Union[str, Path],
-        format: Optional[str] = None
-    ) -> VirtualDevice:
-        """
-        Load a virtual device from a local file.
-        
-        Args:
-            filepath: Path to the device file
-            format: Load format - 'pickle', 'json', or 'yaml'. 
-                   If None, inferred from file extension.
-        
-        Returns:
-            VirtualDevice object
-        
-        Raises:
-            FileNotFoundError: If file does not exist
-            ValueError: If format is unsupported
-        """
-        filepath = Path(filepath)
-        
-        if not filepath.exists():
-            raise FileNotFoundError(f"Device file not found: {filepath}")
-        
-        # Infer format from extension if not specified
-        if format is None:
-            if filepath.suffix == '.pkl':
-                format = 'pickle'
-            elif filepath.suffix == '.json':
-                format = 'json'
-            elif filepath.suffix in ['.yaml', '.yml']:
-                format = 'yaml'
-            else:
-                raise ValueError(f"Cannot infer format from extension: {filepath.suffix}")
-        
-        # Load device
-        if format == 'pickle':
-            with open(filepath, 'rb') as f:
-                device = pickle.load(f)
-        elif format == 'json':
-            with open(filepath, 'r', encoding='utf-8') as f:
-                device_data = json.load(f)
-                device = VirtualDevice.from_dict(device_data)
-        elif format == 'yaml':
-            with open(filepath, 'r', encoding='utf-8') as f:
-                device_data = yaml.safe_load(f)
-                device = VirtualDevice.from_dict(device_data)
-        else:
-            raise ValueError(f"Unsupported format: {format}. Use 'pickle', 'json', or 'yaml'")
-        
-        # Store device
-        self._devices[device.device_id] = device
-        
-        return device
-    
-    def save_all_devices(
-        self,
-        directory: Union[str, Path],
-        format: str = 'pickle'
-    ) -> None:
-        """
-        Save all generated devices to a directory.
-        
-        Args:
-            directory: Directory path to save devices
-            format: Save format - 'pickle', 'json', or 'yaml'
-        """
-        directory = Path(directory)
-        directory.mkdir(parents=True, exist_ok=True)
-        
-        for device_id, device in self._devices.items():
-            ext = '.pkl' if format == 'pickle' else f'.{format}'
-            filepath = directory / f"{device_id}{ext}"
-            self.save_device(device, filepath, format)
-    
-    def load_all_devices(
-        self,
-        directory: Union[str, Path],
-        format: Optional[str] = None
-    ) -> List[VirtualDevice]:
-        """
-        Load all devices from a directory.
-        
-        Args:
-            directory: Directory containing device files
-            format: Format of device files. If None, inferred from files.
-        
-        Returns:
-            List of loaded VirtualDevice objects, sorted by device_id
-        """
-        directory = Path(directory)
-        
-        if not directory.exists():
-            raise FileNotFoundError(f"Directory not found: {directory}")
-        
-        # Determine which file extensions to look for based on format
-        if format == 'pickle':
-            extensions = {'.pkl'}
-        elif format == 'json':
-            extensions = {'.json'}
-        elif format == 'yaml':
-            extensions = {'.yaml', '.yml'}
-        else:
-            # If no format specified, try all supported extensions
-            extensions = {'.pkl', '.json', '.yaml', '.yml'}
-        
-        devices = []
-        for filepath in directory.iterdir():
-            if filepath.is_file() and filepath.suffix.lower() in extensions:
-                try:
-                    device = self.load_device(filepath, format)
-                    # Skip specification files (they don't have device_id)
-                    if not hasattr(device, 'device_id'):
-                        print(f"Warning: Skipping specification file {filepath.name} (not a device)")
-                        continue
-                    devices.append(device)
-                except Exception as e:
-                    print(f"Warning: Failed to load {filepath}: {e}")
-        
-        # Sort devices by device_id for consistent ordering
-        devices.sort(key=lambda d: d.device_id)
-        
-        return devices
+    # File-based device loading removed (DB-only design).
     
     def _generate_device_id(self, model_name: str) -> str:
         """
@@ -596,27 +537,6 @@ class VirtualDeviceGenerator:
         model_short = model_name.lower().replace(' ', '_').replace('-', '_')
         return f"{model_short}_{timestamp}"
     
-    def export_specifications(self, filepath: Union[str, Path], format: str = 'json') -> None:
-        """
-        Export all loaded ASIC specifications to a file.
-        
-        Args:
-            filepath: Path to save specifications
-            format: Export format - 'json' or 'yaml'
-        """
-        filepath = Path(filepath)
-        filepath.parent.mkdir(parents=True, exist_ok=True)
-        
-        specs = {name: spec.to_dict() for name, spec in self._asic_models.items()}
-        
-        if format == 'json':
-            with open(filepath, 'w', encoding='utf-8') as f:
-                json.dump(specs, f, indent=2)
-        elif format == 'yaml':
-            with open(filepath, 'w', encoding='utf-8') as f:
-                yaml.dump(specs, f, default_flow_style=False)
-        else:
-            raise ValueError(f"Unsupported format: {format}. Use 'json' or 'yaml'")
     
     def clear_devices(self) -> None:
         """Clear all stored virtual devices."""
@@ -630,6 +550,46 @@ class VirtualDeviceGenerator:
         """String representation of the generator."""
         return (f"VirtualDeviceGenerator(models={len(self._asic_models)}, "
                 f"devices={len(self._devices)})")
+
+
+def flatten_virtual_device_for_db(device: VirtualDevice) -> Dict[str, object]:
+    """
+    Flatten a VirtualDevice into a DB-ready dict matching init_db.py `devices` table.
+    Includes a full JSON snapshot for forward compatibility.
+    """
+    spec = device.base_specification
+    limits = spec.hardware_limits
+    hidden = device.hidden_parameters
+    payload = device.to_dict()
+    return {
+        "device_id": device.device_id,
+        "asic_model": device.asic_model,
+        "electricity_price": float(device.electricity_price),
+        "created_at": device.created_at,
+        "silicon_quality": float(hidden.silicon_quality),
+        "degradation": float(hidden.degradation),
+        "thermal_resistance": float(hidden.thermal_resistance),
+        "spec_name": spec.name,
+        "spec_manufacturer": spec.manufacturer,
+        "nominal_hashrate": float(spec.nominal_hashrate),
+        "nominal_power": float(spec.nominal_power),
+        "hashrate_per_mhz": float(spec.hashrate_per_mhz),
+        "optimal_voltage": float(spec.optimal_voltage),
+        "base_thermal_resistance": float(spec.base_thermal_resistance),
+        "manufacturer_frequency": float(spec.manufacturer_frequency),
+        "efficiency": float(spec.efficiency),
+        "C": float(spec.C),
+        "min_frequency": float(limits.min_frequency),
+        "max_frequency": float(limits.max_frequency),
+        "min_voltage": float(limits.min_voltage),
+        "max_voltage": float(limits.max_voltage),
+        "max_safe_temperature": float(limits.max_safe_temperature),
+        "min_fan_speed": float(limits.min_fan_speed),
+        "max_fan_speed": float(limits.max_fan_speed),
+        "min_power": float(limits.min_power),
+        "max_power": float(limits.max_power),
+        "device_json": json.dumps(payload, indent=2),
+    }
 
 
 # ============================================================================
@@ -834,7 +794,7 @@ def get_builtin_asic_configurations() -> Dict:
     
 #     # Save devices to files
 #     print("Step 3: Saving devices to local files...")
-#     output_dir = Path("virtual_devices")
+#     # File persistence removed; use SQLite persistence instead.
     
 #     # Clear old device files from the directory
 #     if output_dir.exists():
@@ -845,20 +805,19 @@ def get_builtin_asic_configurations() -> Dict:
 #         print("  - [OK] Old files cleared")
 #     for i, device in enumerate(devices, 1):
 #         # Save in different formats
-#         generator.save_device(device, output_dir / f"{device.device_id}.pkl", format='pickle')
-#         generator.save_device(device, output_dir / f"{device.device_id}.json", format='json')
+#         # File persistence removed; use SQLite persistence instead.
 #         print(f"[OK] Saved device {i} to {output_dir}/{device.device_id}.{{pkl,json}}")
 #     print()
     
 #     # Export specifications
 #     print("Step 4: Exporting ASIC specifications...")
-#     generator.export_specifications(output_dir / "asic_specifications.json", format='json')
+#     # File persistence removed; use built-in specs or your own loader.
 #     print(f"[OK] Exported specifications to {output_dir}/asic_specifications.json")
 #     print()
     
 #     # Load devices from files
 #     print("Step 5: Loading devices from files...")
-#     loaded_devices = generator.load_all_devices(output_dir, format='json')
+#     # File persistence removed; load devices from SQLite instead.
 #     print(f"[OK] Loaded {len(loaded_devices)} devices from files")
 #     print()
     
@@ -889,7 +848,7 @@ def get_builtin_asic_configurations() -> Dict:
 #     # Load specifications from file
 #     print("Step 7: Loading specifications from file...")
 #     generator2 = VirtualDeviceGenerator()
-#     generator2.load_specifications_from_file(output_dir / "asic_specifications.json")
+#     # File persistence removed; load built-in specifications or your own loader.
 #     print(f"[OK] Loaded {len(generator2.get_available_models())} models from file")
 #     print()
     

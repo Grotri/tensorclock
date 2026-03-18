@@ -27,6 +27,7 @@ from asic_physics_simulator import (
     SimulationOutcome
 )
 from virtual_device_generator import VirtualDeviceGenerator, HiddenParameters
+from init_db import init_db, connect, default_db_path
 
 
 def run_parameter_sweep(
@@ -226,7 +227,7 @@ def test_undervolting_optimization(simulator: ASICPhysicsSimulator):
     base_pct = 0.07 + 0.03 * quality_normalized
     undervolt_percentage = min(0.15, base_pct * (silicon_quality ** 2))
     
-    print(f"Undervolting Optimization: {undervolt_percentage*100:.2f}% (× silicon_quality²)")
+    print(f"Undervolting Optimization: {undervolt_percentage*100:.2f}% (x silicon_quality^2)")
     
     # Test at different frequencies
     print("\nTesting undervolting at different frequencies:")
@@ -464,39 +465,19 @@ def main():
     # Load a device
     print_section("Loading Virtual Device")
 
-    # Try to load an existing device (use JSON format to avoid pickle serialization issues)
-    device_path = Path("virtual_devices/antminer_s19_01a5fa6c.json")
+    # DB-only: ensure at least one S19 device exists in SQLite and load it
+    db_path = str(default_db_path())
+    init_db(db_path)
+    generator = VirtualDeviceGenerator()
+    generator.load_builtin_specifications()
 
-    try:
-        # Extract device_id from filename (remove extension and directory)
-        device_id = device_path.stem
-        simulator.load_device(device_id=device_id, device_path=str(device_path))
-        print(f"\n[OK] Successfully loaded device from: {device_path}")
-    except FileNotFoundError:
-        print(f"\n[X] Device not found at: {device_path}")
-        print("Creating a new device...")
+    with connect(db_path) as conn:
+        device_ids = generator.ensure_devices_in_db("Antminer S19", conn, count=1)
+        device_id = device_ids[0]
+        device = generator.load_device_from_db(device_id, conn)
 
-        # Create a new device
-        generator = VirtualDeviceGenerator()
-        generator.load_specifications_from_file("virtual_devices/asic_specifications.json")
-
-        # Generate device with specific hidden parameters
-        hidden_params = {
-            'silicon_quality': 1.03,
-            'degradation': 0.05,
-            'thermal_resistance': 0.15,
-            # 'voltage_tolerance': 1.0,
-            # 'frequency_response': 1.0
-        }
-
-        device = generator.generate_device(
-            model_name="Antminer S19 Pro",
-            hidden_params=hidden_params,
-            electricity_price=0.05
-        )
-
-        simulator.load_device_from_object(device)
-        print(f"[OK] Created and loaded new device: {device.device_id}")
+    simulator.load_device_from_object(device)
+    print(f"\n[OK] Loaded device from DB: {device.device_id}")
     
     # Print device info
     print_device_info(simulator.device)
