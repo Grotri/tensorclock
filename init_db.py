@@ -14,6 +14,8 @@ import argparse
 import sqlite3
 from pathlib import Path
 
+from version import DB_SCHEMA_VERSION
+
 
 def default_db_path() -> Path:
     return Path("data") / "validator.db"
@@ -41,11 +43,19 @@ def init_db(db_path: Path | str = default_db_path()) -> None:
     with connect(db_path) as conn:
         conn.executescript(
             """
+            CREATE TABLE IF NOT EXISTS meta (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
+
             CREATE TABLE IF NOT EXISTS devices (
                 device_id TEXT PRIMARY KEY,
                 asic_model TEXT NOT NULL,
                 electricity_price REAL NOT NULL,
                 created_at TEXT NOT NULL,
+                creator_version TEXT NOT NULL DEFAULT '0',
+                schema_version TEXT NOT NULL DEFAULT '0',
+                is_active INTEGER NOT NULL DEFAULT 1,
 
                 -- Hidden parameters
                 silicon_quality REAL NOT NULL,
@@ -92,6 +102,8 @@ def init_db(db_path: Path | str = default_db_path()) -> None:
                 created_at TEXT NOT NULL,
                 expires_at TEXT NOT NULL,
                 status TEXT NOT NULL DEFAULT 'open',
+                creator_version TEXT NOT NULL DEFAULT '0',
+                schema_version TEXT NOT NULL DEFAULT '0',
                 FOREIGN KEY(device_id) REFERENCES devices(device_id) ON DELETE CASCADE
             );
 
@@ -113,6 +125,25 @@ def init_db(db_path: Path | str = default_db_path()) -> None:
             CREATE INDEX IF NOT EXISTS idx_assignments_miner
             ON assignments (miner_uid, state);
             """
+        )
+
+        # Lightweight migrations for existing DBs (add columns if missing)
+        def _ensure_column(table: str, column: str, decl: str) -> None:
+            cols = {r["name"] for r in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+            if column not in cols:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
+
+        _ensure_column("devices", "creator_version", "TEXT NOT NULL DEFAULT '0'")
+        _ensure_column("devices", "schema_version", "TEXT NOT NULL DEFAULT '0'")
+        _ensure_column("devices", "is_active", "INTEGER NOT NULL DEFAULT 1")
+        _ensure_column("tasks", "creator_version", "TEXT NOT NULL DEFAULT '0'")
+        _ensure_column("tasks", "schema_version", "TEXT NOT NULL DEFAULT '0'")
+
+        # Persist current schema version in meta table
+        conn.execute(
+            "INSERT INTO meta(key, value) VALUES('db_schema_version', ?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (DB_SCHEMA_VERSION,),
         )
 
 

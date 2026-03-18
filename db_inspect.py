@@ -23,6 +23,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from init_db import connect, default_db_path, init_db
+from version import DB_SCHEMA_VERSION, DEVICE_CREATOR_VERSION, TASK_CREATOR_VERSION
 
 
 def _now_iso() -> str:
@@ -51,11 +52,15 @@ class DbSummary:
     now: str
     devices_total: int
     devices_by_model: List[Dict[str, Any]]
+    devices_inactive: int
+    devices_by_creator_version: List[Dict[str, Any]]
     tasks_total: int
     tasks_by_model: List[Dict[str, Any]]
     tasks_by_target: List[Dict[str, Any]]
     tasks_by_status: List[Dict[str, Any]]
     tasks_expired_open: int
+    tasks_superseded: int
+    tasks_by_creator_version: List[Dict[str, Any]]
     tasks_per_device: List[Dict[str, Any]]
     assignments_total: int
     assignments_by_state: List[Dict[str, Any]]
@@ -66,6 +71,7 @@ def inspect_db(db_path: str, limit: int = 5) -> DbSummary:
     init_db(db_path)
     with connect(db_path) as conn:
         devices_total = conn.execute("SELECT COUNT(*) FROM devices").fetchone()[0]
+        devices_inactive = conn.execute("SELECT COUNT(*) FROM devices WHERE is_active = 0").fetchone()[0]
         tasks_total = conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
         assignments_total = conn.execute("SELECT COUNT(*) FROM assignments").fetchone()[0]
 
@@ -76,6 +82,16 @@ def inspect_db(db_path: str, limit: int = 5) -> DbSummary:
             FROM devices
             GROUP BY asic_model
             ORDER BY n DESC, asic_model ASC
+            """,
+        )
+
+        devices_by_creator_version = _fetchall_dict(
+            conn,
+            """
+            SELECT creator_version, COUNT(*) AS n
+            FROM devices
+            GROUP BY creator_version
+            ORDER BY n DESC, creator_version ASC
             """,
         )
 
@@ -112,6 +128,19 @@ def inspect_db(db_path: str, limit: int = 5) -> DbSummary:
             "SELECT COUNT(*) FROM tasks WHERE status='open' AND expires_at <= ?",
             (now,),
         ).fetchone()[0]
+        tasks_superseded = conn.execute(
+            "SELECT COUNT(*) FROM tasks WHERE status='superseded'",
+        ).fetchone()[0]
+
+        tasks_by_creator_version = _fetchall_dict(
+            conn,
+            """
+            SELECT creator_version, COUNT(*) AS n
+            FROM tasks
+            GROUP BY creator_version
+            ORDER BY n DESC, creator_version ASC
+            """,
+        )
 
         tasks_per_device = _fetchall_dict(
             conn,
@@ -152,11 +181,15 @@ def inspect_db(db_path: str, limit: int = 5) -> DbSummary:
             now=now,
             devices_total=int(devices_total),
             devices_by_model=devices_by_model,
+            devices_inactive=int(devices_inactive),
+            devices_by_creator_version=devices_by_creator_version,
             tasks_total=int(tasks_total),
             tasks_by_model=tasks_by_model,
             tasks_by_target=tasks_by_target,
             tasks_by_status=tasks_by_status,
             tasks_expired_open=int(tasks_expired_open),
+            tasks_superseded=int(tasks_superseded),
+            tasks_by_creator_version=tasks_by_creator_version,
             tasks_per_device=tasks_per_device,
             assignments_total=int(assignments_total),
             assignments_by_state=assignments_by_state,
@@ -183,10 +216,13 @@ def main() -> None:
     print("=" * 72)
     print(f"DB: {Path(summary.db_path)}")
     print(f"Now: {summary.now}")
+    print(f"Expected versions: schema={DB_SCHEMA_VERSION}, device={DEVICE_CREATOR_VERSION}, task={TASK_CREATOR_VERSION}")
     print()
 
     print(f"Devices: {summary.devices_total}")
     _print_kv("Devices by model:", summary.devices_by_model)
+    _print_kv("Devices by creator_version:", summary.devices_by_creator_version)
+    print(f"Inactive devices: {summary.devices_inactive}")
     print()
 
     print(f"Tasks: {summary.tasks_total}")
@@ -194,6 +230,8 @@ def main() -> None:
     _print_kv("Tasks by target:", summary.tasks_by_target)
     _print_kv("Tasks by status:", summary.tasks_by_status)
     print(f"Open tasks expired: {summary.tasks_expired_open}")
+    print(f"Superseded tasks: {summary.tasks_superseded}")
+    _print_kv("Tasks by creator_version:", summary.tasks_by_creator_version)
     _print_kv(f"Tasks per device (top {args.limit}):", summary.tasks_per_device)
     print()
 

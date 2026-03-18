@@ -17,6 +17,8 @@ import uuid
 from dataclasses import dataclass, asdict
 from typing import Dict, List, Optional
 
+from version import DB_SCHEMA_VERSION, DEVICE_CREATOR_VERSION
+
 @dataclass
 class HiddenParameters:
     """
@@ -212,10 +214,15 @@ class VirtualDeviceGenerator:
         Persist a VirtualDevice into SQLite `devices` table (see init_db.py schema).
         """
         row = flatten_virtual_device_for_db(device)
+        # Ensure version tags are always set to current values
+        row["creator_version"] = DEVICE_CREATOR_VERSION
+        row["schema_version"] = DB_SCHEMA_VERSION
+        row["is_active"] = 1
         conn.execute(
             """
             INSERT INTO devices (
                 device_id, asic_model, electricity_price, created_at,
+                creator_version, schema_version, is_active,
                 silicon_quality, degradation, thermal_resistance,
                 spec_name, spec_manufacturer, nominal_hashrate, nominal_power, hashrate_per_mhz,
                 optimal_voltage, base_thermal_resistance, manufacturer_frequency, efficiency, C,
@@ -224,6 +231,7 @@ class VirtualDeviceGenerator:
                 device_json
             ) VALUES (
                 :device_id, :asic_model, :electricity_price, :created_at,
+                :creator_version, :schema_version, :is_active,
                 :silicon_quality, :degradation, :thermal_resistance,
                 :spec_name, :spec_manufacturer, :nominal_hashrate, :nominal_power, :hashrate_per_mhz,
                 :optimal_voltage, :base_thermal_resistance, :manufacturer_frequency, :efficiency, :C,
@@ -235,6 +243,9 @@ class VirtualDeviceGenerator:
                 asic_model=excluded.asic_model,
                 electricity_price=excluded.electricity_price,
                 created_at=excluded.created_at,
+                creator_version=excluded.creator_version,
+                schema_version=excluded.schema_version,
+                is_active=excluded.is_active,
                 silicon_quality=excluded.silicon_quality,
                 degradation=excluded.degradation,
                 thermal_resistance=excluded.thermal_resistance,
@@ -280,7 +291,7 @@ class VirtualDeviceGenerator:
 
     def list_device_ids_from_db(self, asic_model: str, conn: sqlite3.Connection, limit: int) -> List[str]:
         rows = conn.execute(
-            "SELECT device_id FROM devices WHERE asic_model = ? ORDER BY created_at DESC LIMIT ?",
+            "SELECT device_id FROM devices WHERE asic_model = ? AND is_active = 1 ORDER BY created_at DESC LIMIT ?",
             (asic_model, limit),
         ).fetchall()
         return [r["device_id"] for r in rows]
@@ -314,8 +325,14 @@ class VirtualDeviceGenerator:
                 return False
 
         # Start with newest candidates
+        # Invalidate devices from older creator_version (soft delete)
+        conn.execute(
+            "UPDATE devices SET is_active = 0 WHERE asic_model = ? AND creator_version <> ?",
+            (asic_model, DEVICE_CREATOR_VERSION),
+        )
+
         candidates = conn.execute(
-            "SELECT device_id, device_json FROM devices WHERE asic_model = ? ORDER BY created_at DESC",
+            "SELECT device_id, device_json FROM devices WHERE asic_model = ? AND is_active = 1 ORDER BY created_at DESC",
             (asic_model,),
         ).fetchall()
 
@@ -566,6 +583,9 @@ def flatten_virtual_device_for_db(device: VirtualDevice) -> Dict[str, object]:
         "asic_model": device.asic_model,
         "electricity_price": float(device.electricity_price),
         "created_at": device.created_at,
+        "creator_version": DEVICE_CREATOR_VERSION,
+        "schema_version": DB_SCHEMA_VERSION,
+        "is_active": 1,
         "silicon_quality": float(hidden.silicon_quality),
         "degradation": float(hidden.degradation),
         "thermal_resistance": float(hidden.thermal_resistance),

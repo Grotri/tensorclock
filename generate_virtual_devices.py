@@ -10,6 +10,7 @@ import random
 
 from init_db import init_db, connect, default_db_path
 from virtual_device_generator import VirtualDeviceGenerator
+from version import DEVICE_CREATOR_VERSION
 
 
 def generate_hidden_parameters(base_thermal_resistance: float) -> dict:
@@ -57,32 +58,25 @@ def generate_virtual_devices_from_templates(
 
             print(f"\n[Model] {model_name} ({spec.nominal_hashrate} TH/s @ {spec.nominal_power} W)")
 
-            # Prefer reusing existing valid devices; generate missing with randomized hidden params
-            existing = generator.list_device_ids_from_db(model_name, conn, devices_per_model)
-            created = 0
-            for device_id in existing:
+            # Ensure DB has enough valid devices for current creator_version
+            existing_before = generator.list_device_ids_from_db(model_name, conn, devices_per_model)
+            for device_id in existing_before:
                 print(f"  - Reuse: {device_id}")
 
-            missing = max(0, devices_per_model - len(existing))
-            for _ in range(missing):
-                hidden_params = generate_hidden_parameters(base_tr)
-                device = generator.generate_device(
-                    model_name=model_name,
-                    hidden_params=hidden_params,
-                    electricity_price=0.05,
-                    apply_thermal_resistance_spread=True,
-                )
-                generator.save_device_to_db(device, conn)
-                created += 1
+            ids = generator.ensure_devices_in_db(model_name, conn, count=devices_per_model)
+            newly_created = [i for i in ids if i not in set(existing_before)]
+            for device_id in newly_created:
+                # Load to display its randomized params
+                dev = generator.load_device_from_db(device_id, conn)
                 print(
-                    f"  - Create: {device.device_id} | "
-                    f"SQ={device.hidden_parameters.silicon_quality:.4f}, "
-                    f"deg={device.hidden_parameters.degradation:.4f}, "
-                    f"TR={device.hidden_parameters.thermal_resistance:.5f} °C/W"
+                    f"  - Create: {dev.device_id} | "
+                    f"SQ={dev.hidden_parameters.silicon_quality:.4f}, "
+                    f"deg={dev.hidden_parameters.degradation:.4f}, "
+                    f"TR={dev.hidden_parameters.thermal_resistance:.5f} °C/W"
                 )
 
-            if created == 0:
-                print("  [OK] Enough devices already present in DB")
+            if not newly_created:
+                print(f"  [OK] Enough devices already present in DB (creator_version={DEVICE_CREATOR_VERSION})")
         conn.commit()
 
     print(f"\n[OK] Virtual devices stored in SQLite: {db_path}")
