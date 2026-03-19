@@ -196,20 +196,66 @@ def init_db(db_url: str | None = None) -> None:
             """
         )
 
-        # assignments
+        # publications (one "publication" = miner-model result across exactly N tasks)
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS publications (
+                publication_id TEXT PRIMARY KEY,
+                miner_uid INTEGER NOT NULL,
+                asic_model TEXT NOT NULL,
+                target TEXT NOT NULL,
+                query_budget INTEGER NOT NULL,
+
+                tasks_creator_version TEXT NOT NULL,
+                tasks_schema_version TEXT NOT NULL,
+
+                model_description_json TEXT NULL,
+
+                state TEXT NOT NULL DEFAULT 'active', -- active|cancelled|completed
+                created_at TEXT NOT NULL,
+                completed_at TEXT NULL,
+                avg_net_profit double precision NULL
+            );
+            """
+        )
+
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_publications_miner_active
+            ON publications (miner_uid, state);
+            """
+        )
+
+        # assignments (one row per task inside a publication)
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS assignments (
+                publication_id TEXT NOT NULL,
                 task_id TEXT NOT NULL,
                 miner_uid INTEGER NOT NULL,
+
                 query_budget INTEGER NOT NULL,
                 queries_used INTEGER NOT NULL DEFAULT 0,
                 assigned_at TEXT NOT NULL,
                 expires_at TEXT NOT NULL,
                 state TEXT NOT NULL DEFAULT 'active',
-                PRIMARY KEY (task_id, miner_uid),
+
+                failure_reason TEXT NULL,
+                net_profit double precision NULL,
+                best_efficiency double precision NULL,
+                completed_at TEXT NULL,
+
+                PRIMARY KEY (publication_id, task_id),
+                FOREIGN KEY(publication_id) REFERENCES publications(publication_id) ON DELETE CASCADE,
                 FOREIGN KEY(task_id) REFERENCES tasks(task_id) ON DELETE CASCADE
             );
+            """
+        )
+
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_assignments_publication
+            ON assignments (publication_id, state);
             """
         )
 
@@ -260,6 +306,7 @@ def reset_db(db_url: str | None = None) -> None:
     if not _is_postgres_url(url):
         raise RuntimeError("reset_db requires a PostgreSQL URL (DATABASE_URL or --db).")
     with connect(url) as conn:
+        conn.execute("DROP TABLE IF EXISTS publications CASCADE")
         conn.execute("DROP TABLE IF EXISTS assignments CASCADE")
         conn.execute("DROP TABLE IF EXISTS tasks CASCADE")
         conn.execute("DROP TABLE IF EXISTS devices CASCADE")

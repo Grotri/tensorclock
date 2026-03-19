@@ -15,6 +15,7 @@ Features implemented here:
 from __future__ import annotations
 
 import json
+import random
 import uuid
 from dataclasses import dataclass, asdict
 from datetime import datetime, timedelta, timezone
@@ -28,6 +29,26 @@ from version import DB_SCHEMA_VERSION, TASK_CREATOR_VERSION
 
 
 OptimizationTarget = Literal["efficiency", "hashrate", "balanced"]
+
+ELECTRICITY_PRICE_MIN = 0.03
+ELECTRICITY_PRICE_MAX = 0.10
+ELECTRICITY_PRICE_STEP = 0.001
+
+
+def _allowed_electricity_prices() -> List[float]:
+    # Use integer math to avoid float rounding issues.
+    min_i = int(round(ELECTRICITY_PRICE_MIN / ELECTRICITY_PRICE_STEP))
+    max_i = int(round(ELECTRICITY_PRICE_MAX / ELECTRICITY_PRICE_STEP))
+    return [round(i * ELECTRICITY_PRICE_STEP, 10) for i in range(min_i, max_i + 1)]
+
+
+def _is_allowed_electricity_price(price: float) -> bool:
+    # Validate both range and step.
+    eps = 1e-12
+    if price < ELECTRICITY_PRICE_MIN - eps or price > ELECTRICITY_PRICE_MAX + eps:
+        return False
+    i = int(round(price / ELECTRICITY_PRICE_STEP))
+    return abs(price - (i * ELECTRICITY_PRICE_STEP)) < 1e-9
 
 
 @dataclass
@@ -83,7 +104,7 @@ def _default_db_path() -> str:
 
 def _fetch_device_ids(conn: Any, asic_model: str, limit: int) -> List[str]:
     rows = conn.execute(
-        "SELECT device_id FROM devices WHERE asic_model = ? ORDER BY created_at DESC LIMIT ?",
+        "SELECT device_id FROM devices WHERE asic_model = ? AND is_active = 1 ORDER BY created_at DESC LIMIT ?",
         (asic_model, limit),
     ).fetchall()
     return [r["device_id"] for r in rows]
@@ -100,13 +121,45 @@ def _ensure_devices(
     Reuses existing, imports from disk if needed, otherwise generates missing.
     Returns exactly `devices_count` device_ids (newest-first selection).
     """
+    allowed_prices = _allowed_electricity_prices()
     device_ids = _fetch_device_ids(conn, asic_model, devices_count)
-    if len(device_ids) >= devices_count:
-        return device_ids[:devices_count]
 
-    # Generate missing devices and persist to DB
-    missing = devices_count - len(device_ids)
+    used_prices: set[float] = set()
+    keep_ids: List[str] = []
+    delete_ids: List[str] = []
+
+    if len(device_ids) >= devices_count:
+        # Validate the newest 5 devices for the test constraints and regenerate only if needed.
+        candidate_ids = device_ids[:devices_count]
+        for did in candidate_ids:
+            dev = generator.load_device_from_db(did, conn)
+            price = float(dev.electricity_price)
+            if (not _is_allowed_electricity_price(price)) or (price in used_prices):
+                delete_ids.append(did)
+            else:
+                used_prices.add(price)
+                keep_ids.append(did)
+
+        if not delete_ids and len(keep_ids) == devices_count:
+            return keep_ids
+
+        for did in delete_ids:
+            conn.execute("DELETE FROM devices WHERE device_id = ?", (did,))
+
+        missing = devices_count - len(keep_ids)
+    else:
+        keep_ids = device_ids
+        for did in keep_ids:
+            dev = generator.load_device_from_db(did, conn)
+            used_prices.add(float(dev.electricity_price))
+        missing = devices_count - len(keep_ids)
+
+    remaining_prices = [p for p in allowed_prices if p not in used_prices]
     for _ in range(missing):
+        if not remaining_prices:
+            raise RuntimeError("Not enough unique electricity_price values to generate devices.")
+        electricity_price = random.choice(remaining_prices)
+        remaining_prices.remove(electricity_price)
         device = generator.generate_device(
             model_name=asic_model,
             hidden_params={
@@ -114,7 +167,7 @@ def _ensure_devices(
                 "degradation": 0.0,
                 "thermal_resistance": generator._asic_models[asic_model].base_thermal_resistance,
             },
-            electricity_price=0.05,
+            electricity_price=electricity_price,
             apply_thermal_resistance_spread=True,
         )
         generator.save_device_to_db(device, conn)
@@ -249,7 +302,7 @@ def _ensure_tasks(
 def generate_miner_task_bundle(
     asic_model: str = "Antminer S19",
     devices_count: int = 5,
-    query_budget: int = 100,
+    query_budget: int = 10,
     target: OptimizationTarget = "efficiency",
     db_path: Path | str = _default_db_path(),
     expires_in: timedelta = timedelta(hours=1),

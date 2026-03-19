@@ -531,12 +531,12 @@ class ASICPhysicsSimulator:
 
         # Calculate temperature rise using device-specific thermal resistance
         temp_rise = effective_power * hidden.thermal_resistance
-        print(f'Base temp rise: {temp_rise:.2f}°C')
+        # Keep simulation deterministic/noisy but avoid stdout spam in validator.
 
         # Apply cooling (fan speed)
         cooling_efficiency = params.fan_speed / 100.0
         temp_rise /= (1 + (0.97 * cooling_efficiency))
-        print(f'Temp rise after cooling: {temp_rise:.2f}°C (Cooling efficiency: {cooling_efficiency:.2f})')
+        # Keep simulation logs minimal; warnings are returned via SimulationOutcome.
 
         # Final temperature
         temperature = ambient_temp + temp_rise

@@ -10,6 +10,9 @@ import bittensor as bt
 from bittensor_wallet import Wallet
 import threading
 import sys
+from concurrent.futures import ThreadPoolExecutor
+
+import uvicorn
 
 logging.basicConfig(
     level=logging.INFO,
@@ -19,6 +22,12 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 HEARTBEAT_TIMEOUT = 600  # seconds
+
+# Local imports
+from init_db import connect, init_db
+from task_manager import generate_miner_task_bundle
+from validator_api import app, init_validator_api
+from version import DB_SCHEMA_VERSION, TASK_CREATOR_VERSION
 
 def heartbeat_monitor(last_heartbeat, stop_event):
     while not stop_event.is_set():
@@ -90,6 +99,36 @@ def main(network: str, netuid: int, coldkey: str, hotkey: str, log_level: str):
         tempo = subtensor.get_subnet_hyperparameters(netuid).tempo
         logger.info(f"Subnet tempo: {tempo} blocks")
 
+        # ------------------------------------------------------------------
+        # MVP startup: initialize DB, ensure tasks/devices, start HTTP API
+        # ------------------------------------------------------------------
+        init_db()
+        # Current codebase has 1 built-in model ("Antminer S19").
+        generate_miner_task_bundle(
+            asic_model="Antminer S19",
+            devices_count=5,
+            query_budget=10,
+            target="efficiency",
+        )
+
+        from virtual_device_generator import VirtualDeviceGenerator
+
+        db_url = os.getenv("DATABASE_URL", "").strip()
+        if not db_url:
+            raise RuntimeError("DATABASE_URL is required to run the validator with PostgreSQL.")
+
+        generator = VirtualDeviceGenerator()
+        generator.load_builtin_specifications()
+
+        sim_workers = int(os.getenv("VALIDATOR_SIM_WORKERS", "4"))
+        executor = ThreadPoolExecutor(max_workers=sim_workers)
+        init_validator_api(db_url=db_url, generator=generator, executor=executor)
+
+        api_port = int(os.getenv("VALIDATOR_API_PORT", "8090"))
+        server = uvicorn.Server(uvicorn.Config(app, host="0.0.0.0", port=api_port, log_level="info"))
+        threading.Thread(target=server.run, daemon=True).start()
+        logger.info(f"Validator API started on :{api_port}")
+
         last_weight_block = 0
 
         # Main validator loop
@@ -107,8 +146,31 @@ def main(network: str, netuid: int, coldkey: str, hotkey: str, log_level: str):
                 if blocks_since_last >= tempo:
                     logger.info(f"Block {current_block}: Setting weights (tempo={tempo})")
 
-                    # Set 100% weight on UID 0
-                    uids = [0]
+                    # Winner-takes-all based on completed publications.
+                    winner_uid = None
+                    try:
+                        with connect() as conn:
+                            row = conn.execute(
+                                """
+                                SELECT miner_uid
+                                FROM publications
+                                WHERE state='completed'
+                                  AND tasks_creator_version = ?
+                                  AND tasks_schema_version = ?
+                                ORDER BY avg_net_profit DESC NULLS LAST, completed_at ASC
+                                LIMIT 1
+                                """,
+                                (TASK_CREATOR_VERSION, DB_SCHEMA_VERSION),
+                            ).fetchone()
+                            if row is not None and row.get("miner_uid") is not None:
+                                winner_uid = int(row["miner_uid"])
+                    except Exception as e:
+                        logger.error(f"Failed to pick winner from DB: {e}")
+
+                    if winner_uid is None:
+                        winner_uid = 0
+
+                    uids = [winner_uid]
                     weights = [1.0]
 
                     # Set weights on chain
