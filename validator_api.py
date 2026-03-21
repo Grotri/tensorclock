@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import logging
+import os
 import threading
 import uuid
 from dataclasses import dataclass
@@ -9,6 +11,7 @@ from typing import Any, Optional
 
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
+from starlette.requests import Request
 
 from asic_physics_simulator import (
     ASICPhysicsSimulator,
@@ -16,12 +19,37 @@ from asic_physics_simulator import (
     OptimizationParameters,
 )
 from init_db import connect
+from publication_expiry import (
+    deadline_iso_from_now,
+    effective_publication_deadline,
+    expire_publication_if_overdue,
+)
 from task_manager import ELECTRICITY_PRICE_MAX, ELECTRICITY_PRICE_MIN  # noqa: F401
 from version import DB_SCHEMA_VERSION, TASK_CREATOR_VERSION
 from virtual_device_generator import VirtualDeviceGenerator
 
+logger = logging.getLogger(__name__)
 
 app = FastAPI(title="TensorClock Validator API")
+
+
+def _epistula_required() -> bool:
+    """When true, POST bodies must include valid Epistula headers (miner hotkey signature)."""
+    return os.getenv("EPISTULA_REQUIRED", "false").strip().lower() in ("1", "true", "yes")
+
+
+async def _read_body_with_optional_epistula(request: Request) -> bytes:
+    body = await request.body()
+    if not _epistula_required():
+        return body
+    from epistula import verify_epistula_request
+
+    try:
+        hk = verify_epistula_request(headers=request.headers, body=body)
+    except ValueError as e:
+        raise HTTPException(status_code=401, detail=str(e)) from e
+    logger.debug("Epistula OK hotkey=%s", hk)
+    return body
 
 
 class ClaimRequest(BaseModel):
@@ -45,6 +73,7 @@ class TaskPayload(BaseModel):
 
 class ClaimResponse(BaseModel):
     publication_id: str
+    publication_deadline_at: str
     task: TaskPayload
     assignment_state: str
     queries_used: int
@@ -121,7 +150,9 @@ async def health() -> dict[str, str]:
 
 
 @app.post("/task", response_model=ClaimResponse)
-async def claim_task(req: ClaimRequest) -> ClaimResponse:
+async def claim_task(request: Request) -> ClaimResponse:
+    body = await _read_body_with_optional_epistula(request)
+    req = ClaimRequest.model_validate_json(body)
     state = _get_state()
     now_iso = _now_iso()
 
@@ -132,18 +163,19 @@ async def claim_task(req: ClaimRequest) -> ClaimResponse:
             pub_id = f"pub_{uuid.uuid4().hex}"
             # Cancel all previous publications for this miner (including completed) to enforce annulment.
             conn.execute(
-                "UPDATE publications SET state='cancelled', completed_at=? WHERE miner_uid=? AND publication_id <> ? AND state IN ('active','completed')",
+                "UPDATE publications SET state='cancelled', completed_at=? WHERE miner_uid=? AND publication_id <> ? AND state IN ('active','completed','expired')",
                 (now_iso, req.miner_uid, pub_id),
             )
             model_description_json = json.dumps(req.model_description_json) if req.model_description_json is not None else None
+            pub_deadline_iso = deadline_iso_from_now()
             conn.execute(
                 """
                 INSERT INTO publications (
                     publication_id, miner_uid, asic_model, target, query_budget,
                     tasks_creator_version, tasks_schema_version,
                     model_description_json,
-                    state, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'active', ?)
+                    state, created_at, publication_deadline_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?)
                 """,
                 (
                     pub_id,
@@ -155,20 +187,39 @@ async def claim_task(req: ClaimRequest) -> ClaimResponse:
                     DB_SCHEMA_VERSION,
                     model_description_json,
                     now_iso,
+                    pub_deadline_iso,
                 ),
             )
 
         # Validate publication ownership and status.
         pub_row = conn.execute(
-            "SELECT publication_id, miner_uid, asic_model, target, tasks_creator_version, tasks_schema_version, state FROM publications WHERE publication_id = ?",
+            """
+            SELECT publication_id, miner_uid, asic_model, target, tasks_creator_version, tasks_schema_version,
+                   state, publication_deadline_at, created_at
+            FROM publications WHERE publication_id = ?
+            """,
             (pub_id,),
         ).fetchone()
         if pub_row is None:
             raise HTTPException(status_code=404, detail="publication_id not found")
         if int(pub_row["miner_uid"]) != int(req.miner_uid):
             raise HTTPException(status_code=403, detail="publication_id does not belong to miner_uid")
-        if pub_row["state"] != "active":
-            raise HTTPException(status_code=409, detail=f"publication state is {pub_row['state']}")
+        if expire_publication_if_overdue(conn, pub_id, now_iso):
+            raise HTTPException(status_code=410, detail="publication deadline expired")
+        pub_row = conn.execute(
+            """
+            SELECT publication_id, miner_uid, asic_model, target, tasks_creator_version, tasks_schema_version,
+                   state, publication_deadline_at, created_at
+            FROM publications WHERE publication_id = ?
+            """,
+            (pub_id,),
+        ).fetchone()
+        if pub_row is None or pub_row["state"] != "active":
+            raise HTTPException(
+                status_code=409,
+                detail=f"publication state is {pub_row['state'] if pub_row else 'missing'}",
+            )
+        pub_deadline_response = effective_publication_deadline(pub_row)
 
         # If miner already has an active assignment inside this publication, return the same task.
         active = conn.execute(
@@ -186,6 +237,7 @@ async def claim_task(req: ClaimRequest) -> ClaimResponse:
         if active is not None:
             return ClaimResponse(
                 publication_id=pub_id,
+                publication_deadline_at=pub_deadline_response,
                 task=TaskPayload(
                     task_id=active["task_id"],
                     device_id=active["device_id"],
@@ -245,6 +297,7 @@ async def claim_task(req: ClaimRequest) -> ClaimResponse:
 
         return ClaimResponse(
             publication_id=pub_id,
+            publication_deadline_at=pub_deadline_response,
             task=TaskPayload(
                 task_id=task["task_id"],
                 device_id=task["device_id"],
@@ -260,12 +313,36 @@ async def claim_task(req: ClaimRequest) -> ClaimResponse:
 
 
 @app.post("/task/submit", response_model=SubmitResponse)
-async def submit_task(req: SubmitRequest) -> SubmitResponse:
+async def submit_task(request: Request) -> SubmitResponse:
+    body = await _read_body_with_optional_epistula(request)
+    req = SubmitRequest.model_validate_json(body)
     state = _get_state()
     now_iso = _now_iso()
 
     # Load assignment and task rows on the main thread (cheap DB reads).
     with connect(state.db_url) as conn:
+        a = conn.execute(
+            """
+            SELECT
+                a.publication_id,
+                a.task_id,
+                a.miner_uid,
+                a.query_budget,
+                a.queries_used,
+                a.state,
+                p.state AS pub_state
+            FROM assignments a
+            JOIN publications p ON p.publication_id = a.publication_id
+            WHERE a.publication_id = ? AND a.task_id = ?
+            """,
+            (req.publication_id, req.task_id),
+        ).fetchone()
+        if a is None:
+            raise HTTPException(status_code=404, detail="assignment not found")
+        if a["pub_state"] != "active":
+            raise HTTPException(status_code=409, detail=f"publication state is {a['pub_state']}")
+        if expire_publication_if_overdue(conn, req.publication_id, now_iso):
+            raise HTTPException(status_code=410, detail="publication deadline expired")
         a = conn.execute(
             """
             SELECT publication_id, task_id, miner_uid, query_budget, queries_used, state
@@ -274,10 +351,8 @@ async def submit_task(req: SubmitRequest) -> SubmitResponse:
             """,
             (req.publication_id, req.task_id),
         ).fetchone()
-        if a is None:
-            raise HTTPException(status_code=404, detail="assignment not found")
-        if a["state"] != "active":
-            raise HTTPException(status_code=409, detail=f"assignment is {a['state']}")
+        if a is None or a["state"] != "active":
+            raise HTTPException(status_code=409, detail=f"assignment is {a['state'] if a else 'missing'}")
 
         if int(a["queries_used"]) >= int(a["query_budget"]):
             conn.execute(
@@ -320,6 +395,11 @@ async def submit_task(req: SubmitRequest) -> SubmitResponse:
     overheated = _is_overheated(device=device, temperature=float(outcome.temperature))
 
     with connect(state.db_url) as conn:
+        if expire_publication_if_overdue(conn, req.publication_id, _now_iso()):
+            raise HTTPException(
+                status_code=410,
+                detail="publication deadline expired before result could be committed",
+            )
         # Refresh assignment (queries_used) because we may have released the first connection.
         a2 = conn.execute(
             """

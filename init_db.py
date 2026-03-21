@@ -211,10 +211,11 @@ def init_db(db_url: str | None = None) -> None:
 
                 model_description_json TEXT NULL,
 
-                state TEXT NOT NULL DEFAULT 'active', -- active|cancelled|completed
+                state TEXT NOT NULL DEFAULT 'active', -- active|cancelled|completed|expired
                 created_at TEXT NOT NULL,
                 completed_at TEXT NULL,
-                avg_net_profit double precision NULL
+                avg_net_profit double precision NULL,
+                publication_deadline_at TEXT NULL
             );
             """
         )
@@ -285,6 +286,19 @@ def init_db(db_url: str | None = None) -> None:
         _ensure_column("devices", "is_active", "INTEGER NOT NULL DEFAULT 1")
         _ensure_column("tasks", "creator_version", "TEXT NOT NULL DEFAULT '0'")
         _ensure_column("tasks", "schema_version", "TEXT NOT NULL DEFAULT '0'")
+        _ensure_column("publications", "publication_deadline_at", "TEXT NULL")
+
+        # Backfill deadline for existing publications (created_at + 10 minutes)
+        conn.execute(
+            """
+            UPDATE publications
+            SET publication_deadline_at = (
+                COALESCE(created_at::timestamptz, created_at::timestamp AT TIME ZONE 'UTC')
+                + interval '10 minutes'
+            )::text
+            WHERE publication_deadline_at IS NULL
+            """
+        )
 
         # Persist schema version
         conn.execute(

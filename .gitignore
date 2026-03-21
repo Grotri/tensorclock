@@ -4,8 +4,10 @@ virtual_devices/
 data/
 tasks.json
 .cursorrules
-knowledge/
 .gitignore
 env.example
 .vscode/settings.json
 .env
+docs/
+knowledge/
+.cursorignore

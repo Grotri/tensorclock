@@ -1,7 +1,3 @@
-"""
-Simplest possible Bittensor subnet validator. Simply burns everything to UID 0.
-"""
-
 import os
 import time
 import click
@@ -25,6 +21,7 @@ HEARTBEAT_TIMEOUT = 600  # seconds
 
 # Local imports
 from init_db import connect, init_db
+from publication_expiry import publication_expiry_sweep_loop
 from task_manager import generate_miner_task_bundle
 from validator_api import app, init_validator_api
 from version import DB_SCHEMA_VERSION, TASK_CREATOR_VERSION
@@ -76,6 +73,7 @@ def main(network: str, netuid: int, coldkey: str, hotkey: str, log_level: str):
     heartbeat_thread = threading.Thread(target=heartbeat_monitor, args=(last_heartbeat, stop_event), daemon=True)
     heartbeat_thread.start()
 
+    pub_expiry_thread = None
     try:
         # Initialize wallet, subtensor, and metagraph
         wallet = Wallet(name=coldkey, hotkey=hotkey)
@@ -99,11 +97,8 @@ def main(network: str, netuid: int, coldkey: str, hotkey: str, log_level: str):
         tempo = subtensor.get_subnet_hyperparameters(netuid).tempo
         logger.info(f"Subnet tempo: {tempo} blocks")
 
-        # ------------------------------------------------------------------
-        # MVP startup: initialize DB, ensure tasks/devices, start HTTP API
-        # ------------------------------------------------------------------
         init_db()
-        # Current codebase has 1 built-in model ("Antminer S19").
+        
         generate_miner_task_bundle(
             asic_model="Antminer S19",
             devices_count=5,
@@ -123,6 +118,18 @@ def main(network: str, netuid: int, coldkey: str, hotkey: str, log_level: str):
         sim_workers = int(os.getenv("VALIDATOR_SIM_WORKERS", "4"))
         executor = ThreadPoolExecutor(max_workers=sim_workers)
         init_validator_api(db_url=db_url, generator=generator, executor=executor)
+
+        pub_expiry_thread = threading.Thread(
+            target=publication_expiry_sweep_loop,
+            args=(db_url, stop_event),
+            daemon=True,
+            name="publication-expiry-sweep",
+        )
+        pub_expiry_thread.start()
+        logger.info(
+            "Publication deadline sweep started (interval from PUBLICATION_EXPIRE_SWEEP_INTERVAL_SEC, "
+            "default 30s; batch cap PUBLICATION_EXPIRE_SWEEP_BATCH_LIMIT)"
+        )
 
         api_port = int(os.getenv("VALIDATOR_API_PORT", "8090"))
         server = uvicorn.Server(uvicorn.Config(app, host="0.0.0.0", port=api_port, log_level="info"))
@@ -206,6 +213,8 @@ def main(network: str, netuid: int, coldkey: str, hotkey: str, log_level: str):
     finally:
         stop_event.set()
         heartbeat_thread.join(timeout=2)
+        if pub_expiry_thread is not None:
+            pub_expiry_thread.join(timeout=2)
 
 if __name__ == "__main__":
     main()
