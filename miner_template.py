@@ -5,8 +5,8 @@ Contract alignment:
   - validator API: see `validator_api.py` (`POST /task`, `POST /task/submit`, `GET /health`)
   - `POST /task` includes `publication_deadline_at` (wall-clock); **410 Gone** if that publication is past deadline
   - optional Epistula signing on POST bodies (see `epistula.py`, `EPISTULA_REQUIRED` on validator)
-  - endpoint discovery: read validator commitments from chain
-    (`subtensor.get_all_commitments(netuid)`), then query **every** live validator (no priority)
+  - endpoint discovery: per-UID ``subtensor.get_commitment``; see ``_get_commitment_quiet`` (SDK otherwise logs
+    ERROR on UIDs with empty/broken commitment metadata — not a TensorClock bug), then **every** live validator
   - optional stake filter: `min_validator_stake` vs `metagraph.S[uid]` (default 0)
 
 This file intentionally has NO DB dependency: miner only talks to validators over HTTP.
@@ -17,8 +17,9 @@ from __future__ import annotations
 import abc
 import json
 import logging
+from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Any, List, Optional, Sequence
+from typing import Any, Iterator, List, Optional, Sequence
 
 import bittensor as bt
 import requests
@@ -220,9 +221,47 @@ def _normalize_endpoint(raw: str) -> Optional[str]:
     return value.rstrip("/")
 
 
+@contextmanager
+def _suppress_root_logging_temporarily(level: int = logging.CRITICAL) -> Iterator[None]:
+    """
+    Bittensor ``Subtensor.get_commitment`` logs ``logging.error(exception)`` when ``decode_metadata`` fails
+    (e.g. uid with no commitment → metadata shape None → ``decode_metadata`` does ``metadata['info'][...]``
+    and raises ``TypeError: 'NoneType' object is not subscriptable``). That is expected for empty UIDs; the SDK
+    still returns \"\" but pollutes our miner logs. Briefly raise the *root* logger level so those ERROR lines
+    are not emitted during discovery (single-threaded miner startup only).
+
+    Some SDK builds attach handlers on the ``bittensor`` logger with their own level, so root-only suppression
+    is not enough — also raise common bittensor sub-loggers for the discovery window.
+    """
+    root = logging.getLogger()
+    prev: list[tuple[logging.Logger, int]] = [(root, root.level)]
+    root.setLevel(level)
+    for name in ("bittensor", "bittensor.core", "bittensor.core.subtensor"):
+        lg = logging.getLogger(name)
+        prev.append((lg, lg.level))
+        lg.setLevel(level)
+    try:
+        yield
+    finally:
+        for lg, old in prev:
+            lg.setLevel(old)
+
+
+def _get_commitment_quiet(subtensor: Any, netuid: int, uid: int) -> str:
+    """``subtensor.get_commitment`` without SDK ERROR spam on decode failure (see _suppress_root_logging_temporarily)."""
+    with _suppress_root_logging_temporarily():
+        return subtensor.get_commitment(netuid, uid)
+
+
 def _neuron_stake(metagraph: Any, uid: int) -> float:
     """Stake S[uid] as float (subnet alpha units; depends on SDK version)."""
-    s = metagraph.S[uid]
+    s_arr = getattr(metagraph, "S", None)
+    if s_arr is None:
+        return 0.0
+    try:
+        s = s_arr[uid]
+    except (IndexError, TypeError, KeyError):
+        return 0.0
     try:
         return float(s)
     except Exception:
@@ -254,33 +293,51 @@ def discover_validator_endpoints(
     """
     subtensor = bt.Subtensor(network=network)
     metagraph = bt.Metagraph(netuid=netuid, network=network)
-    metagraph.sync(subtensor=subtensor)
-    commitments = subtensor.get_all_commitments(netuid)
+    with _suppress_root_logging_temporarily():
+        metagraph.sync(subtensor=subtensor)
 
-    def _extract(uid: int) -> Optional[str]:
-        raw = None
-        if isinstance(commitments, dict):
-            raw = commitments.get(uid)
-            if raw is None:
-                raw = commitments.get(str(uid))
-        elif isinstance(commitments, list) and 0 <= uid < len(commitments):
-            raw = commitments[uid]
+    def _commitment_for_uid(uid: int) -> Optional[str]:
+        """
+        Read commitment per-UID (same chain query as ``scripts/set_validator_commitment.py``).
+
+        Uses ``_get_commitment_quiet`` because upstream ``bittensor`` ``get_commitment`` does
+        ``logging.error(error)`` on *any* ``decode_metadata`` failure (bittensor/core/subtensor.py ~1590),
+        which for empty UIDs often prints only ``'NoneType' object is not subscriptable`` — misleading noise.
+        """
+        try:
+            raw = _get_commitment_quiet(subtensor, netuid, uid)
+        except Exception:
+            return None
         if raw is None:
+            return None
+        if isinstance(raw, str) and not raw.strip():
             return None
         if isinstance(raw, (list, tuple)) and raw:
             raw = raw[0]
-        return _normalize_endpoint(str(raw))
+        s = str(raw).strip()
+        if not s:
+            return None
+        return _normalize_endpoint(s)
 
     out: list[str] = []
     n = int(metagraph.n)
+    vperm = getattr(metagraph, "validator_permit", None)
     for uid in range(n):
-        if blacklist_force_validator_permit and not bool(metagraph.validator_permit[uid]):
-            continue
+        if blacklist_force_validator_permit:
+            if vperm is None:
+                # Some SDKs leave this unset; do not block discovery.
+                pass
+            else:
+                try:
+                    if not bool(vperm[uid]):
+                        continue
+                except (IndexError, TypeError, KeyError):
+                    continue
         stake = _neuron_stake(metagraph, uid)
         # Same rule as synth-subnet: blacklist when stake <= threshold
         if stake <= float(blacklist_validator_min_stake):
             continue
-        endpoint = _extract(uid)
+        endpoint = _commitment_for_uid(uid)
         if not endpoint:
             continue
         try:
@@ -359,6 +416,9 @@ class MinerRunner:
                 break
             if r.status_code == 404:
                 logger.info("No more tasks available (404). Ending run.")
+                # Validator may finish the publication only on this path (pool exhausted after last submit).
+                if tasks_attempted > 0 and publication_id:
+                    completed = True
                 break
             r.raise_for_status()
             data = r.json()

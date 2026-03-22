@@ -12,6 +12,8 @@ Requirements:
   - When validator runs with ``EPISTULA_REQUIRED=true``, set wallet env
     (``WALLET_NAME`` / ``HOTKEY_NAME``) so requests are signed.
 
+Full CLI reference: ``docs/miner_reference.md`` (or ``python miner_reference.py --help``).
+
 Run (all validators, full publication each)::
 
     python miner_reference.py --network finney --netuid 1 --miner-uid 1
@@ -19,6 +21,10 @@ Run (all validators, full publication each)::
 Smoke (first validator only, one task)::
 
     python miner_reference.py --miner-uid 1 --smoke
+
+Local HTTP API without on-chain discovery::
+
+    python miner_reference.py --network ws://127.0.0.1:9945 --netuid 2 --validator-url http://127.0.0.1:8090 --miner-uid 2 --smoke
 """
 
 from __future__ import annotations
@@ -93,6 +99,46 @@ class NominalS19MinerModel(MinerModel):
 
 def _load_wallet(coldkey: str, hotkey: str) -> Wallet:
     return Wallet(name=coldkey, hotkey=hotkey)
+
+
+def _effective_miner_uid_on_chain(
+    network: str,
+    netuid: int,
+    cli_uid: int,
+    wallet: Optional[Wallet],
+) -> int:
+    """
+    On-chain weights use subnet UID. ``miner_uid`` in API/DB must match this UID.
+
+    If a wallet is loaded, resolve UID via Subtensor; otherwise keep CLI --miner-uid.
+    """
+    if wallet is None:
+        return int(cli_uid)
+    try:
+        import bittensor as bt
+    except ImportError:
+        logger.warning("bittensor not installed; using --miner-uid=%s", cli_uid)
+        return int(cli_uid)
+    try:
+        sub = bt.Subtensor(network=network)
+        uid = sub.get_uid_for_hotkey_on_subnet(wallet.hotkey.ss58_address, netuid)
+    except Exception as e:
+        logger.warning("Could not resolve miner UID on chain (%s); using --miner-uid=%s", e, cli_uid)
+        return int(cli_uid)
+    if uid is None:
+        logger.warning(
+            "Miner hotkey is not registered on netuid %s; using --miner-uid=%s (validator weights will not match)",
+            netuid,
+            cli_uid,
+        )
+        return int(cli_uid)
+    if int(uid) != int(cli_uid):
+        logger.info(
+            "Using on-chain miner UID=%s (wallet hotkey) instead of --miner-uid=%s",
+            uid,
+            cli_uid,
+        )
+    return int(uid)
 
 
 def _resolve_validator_urls(args: argparse.Namespace) -> List[str]:
@@ -190,6 +236,10 @@ def main(argv: Optional[list[str]] = None) -> int:
     if not args.no_wallet:
         wallet = _load_wallet(args.wallet_name, args.hotkey_name)
 
+    miner_uid = _effective_miner_uid_on_chain(
+        args.network, args.netuid, args.miner_uid, wallet
+    )
+
     try:
         urls = _resolve_validator_urls(args)
     except Exception as e:
@@ -212,7 +262,7 @@ def main(argv: Optional[list[str]] = None) -> int:
 
         if args.smoke:
             r = client.claim_task(
-                miner_uid=args.miner_uid,
+                miner_uid=miner_uid,
                 asic_model=args.asic_model,
                 target=args.target,
                 publication_id=None,
@@ -240,7 +290,7 @@ def main(argv: Optional[list[str]] = None) -> int:
 
         result = runner.run_publication(
             model,
-            miner_uid=args.miner_uid,
+            miner_uid=miner_uid,
             asic_model=args.asic_model,
             target=args.target,
             model_description_json={"model": "NominalS19MinerModel", "version": "1.0"},

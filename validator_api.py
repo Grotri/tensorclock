@@ -134,6 +134,55 @@ def _is_overheated(*, device: Any, temperature: float) -> bool:
     return float(temperature) > float(limits.max_safe_temperature)
 
 
+def _try_finalize_publication_when_pool_exhausted(conn: Any, publication_id: str, now_iso: str) -> None:
+    """
+    When claim finds no next task (404), all work for this publication may still be done:
+    every pool task has a terminal assignment. In that case mark publication completed.
+
+    This closes the gap when submit-side completion did not fire (e.g. total_tasks_expected
+    snapshot != number of assignments actually claimed, or legacy expected pool COUNT drift).
+    """
+    pub = conn.execute(
+        "SELECT state FROM publications WHERE publication_id=? AND state='active'",
+        (publication_id,),
+    ).fetchone()
+    if pub is None:
+        return
+    row = conn.execute(
+        """
+        SELECT
+          (SELECT COUNT(*) FROM assignments WHERE publication_id=?) AS assign_total,
+          (SELECT COUNT(*) FROM assignments WHERE publication_id=? AND state='active') AS active_cnt,
+          (SELECT COUNT(*) FROM assignments WHERE publication_id=? AND state IN ('completed','failed')) AS closed_cnt
+        """,
+        (publication_id, publication_id, publication_id),
+    ).fetchone()
+    if row is None:
+        return
+    assign_total = int(row["assign_total"])
+    active_cnt = int(row["active_cnt"])
+    closed_cnt = int(row["closed_cnt"])
+    if assign_total <= 0 or active_cnt != 0 or closed_cnt != assign_total:
+        return
+    avg = conn.execute(
+        "SELECT AVG(net_profit) AS avg FROM assignments WHERE publication_id=?",
+        (publication_id,),
+    ).fetchone()["avg"]
+    conn.execute(
+        """
+        UPDATE publications
+        SET state='completed', avg_net_profit=?, completed_at=?
+        WHERE publication_id=? AND state='active'
+        """,
+        (avg, now_iso, publication_id),
+    )
+    logger.info(
+        "publication %s completed (claim/pool-exhausted path) avg_net_profit=%s",
+        publication_id,
+        avg,
+    )
+
+
 def _run_simulation_sync(*, device: Any, ambient_level: AmbientTemperatureLevel, req: SubmitRequest) -> Any:
     sim = ASICPhysicsSimulator()
     sim.load_device_from_object(device)
@@ -161,21 +210,33 @@ async def claim_task(request: Request) -> ClaimResponse:
         pub_id = req.publication_id
         if not pub_id:
             pub_id = f"pub_{uuid.uuid4().hex}"
-            # Cancel all previous publications for this miner (including completed) to enforce annulment.
+            # Cancel in-flight / stale work only. Do NOT cancel `completed` rows — they are needed for
+            # on-chain weights and audit; a new run supersedes scoring by creating a fresh publication.
             conn.execute(
-                "UPDATE publications SET state='cancelled', completed_at=? WHERE miner_uid=? AND publication_id <> ? AND state IN ('active','completed','expired')",
+                "UPDATE publications SET state='cancelled', completed_at=? WHERE miner_uid=? AND publication_id <> ? AND state IN ('active','expired')",
                 (now_iso, req.miner_uid, pub_id),
             )
             model_description_json = json.dumps(req.model_description_json) if req.model_description_json is not None else None
             pub_deadline_iso = deadline_iso_from_now()
+            # Snapshot of how many pool tasks exist for this model/target at publication start.
+            # Submit completion compares assignment count to this (not live COUNT(tasks), which can grow and block completion).
+            snap = conn.execute(
+                """
+                SELECT COUNT(*) AS n FROM tasks
+                WHERE asic_model = ? AND target = ? AND status = 'open'
+                  AND creator_version = ? AND schema_version = ?
+                """,
+                (req.asic_model, req.target, TASK_CREATOR_VERSION, DB_SCHEMA_VERSION),
+            ).fetchone()
+            total_tasks_expected = int(snap["n"]) if snap and snap.get("n") is not None else 0
             conn.execute(
                 """
                 INSERT INTO publications (
                     publication_id, miner_uid, asic_model, target, query_budget,
                     tasks_creator_version, tasks_schema_version,
                     model_description_json,
-                    state, created_at, publication_deadline_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?)
+                    state, created_at, publication_deadline_at, total_tasks_expected
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?)
                 """,
                 (
                     pub_id,
@@ -188,6 +249,7 @@ async def claim_task(request: Request) -> ClaimResponse:
                     model_description_json,
                     now_iso,
                     pub_deadline_iso,
+                    total_tasks_expected,
                 ),
             )
 
@@ -276,6 +338,10 @@ async def claim_task(request: Request) -> ClaimResponse:
         ).fetchone()
 
         if task is None:
+            _try_finalize_publication_when_pool_exhausted(conn, pub_id, now_iso)
+            # Must commit before raising: DBConnection.__exit__ rolls back on exception, which would undo
+            # the UPDATE to state='completed' inside _try_finalize_publication_when_pool_exhausted.
+            conn.commit()
             raise HTTPException(status_code=404, detail="No available tasks for this publication")
 
         conn.execute(
@@ -461,12 +527,21 @@ async def submit_task(request: Request) -> SubmitResponse:
             ),
         )
 
-        # Check if publication is done (all 25 tasks closed).
-        pub = conn.execute(
-            "SELECT asic_model, target FROM publications WHERE publication_id=? AND state='active'",
+        # Check if publication is done: all assignments for this publication must be terminal,
+        # and their count must match total_tasks_expected (snapshot at publication creation).
+        #
+        # IMPORTANT: do not use `WHERE state='active'` alone — if another worker expires the publication
+        # between the pre-sim expiry check and here, or the row is already `completed`, we must not
+        # return early with publication_completed=False (that leaves DB stuck `active` forever).
+        pub_row = conn.execute(
+            """
+            SELECT asic_model, target, total_tasks_expected, state
+            FROM publications WHERE publication_id=?
+            """,
             (req.publication_id,),
         ).fetchone()
-        if pub is None:
+        if pub_row is None:
+            logger.error("publication %s missing after assignment update; cannot finalize", req.publication_id)
             return SubmitResponse(
                 publication_id=req.publication_id,
                 task_id=req.task_id,
@@ -477,18 +552,43 @@ async def submit_task(request: Request) -> SubmitResponse:
                 overheated=overheated,
                 publication_completed=False,
             )
+        pstate = str(pub_row.get("state") or "")
+        if pstate == "completed":
+            return SubmitResponse(
+                publication_id=req.publication_id,
+                task_id=req.task_id,
+                state=final_state,
+                queries_used=new_queries_used,
+                temperature=float(outcome.temperature),
+                warning=outcome.warning,
+                overheated=overheated,
+                publication_completed=True,
+            )
+        if pstate != "active":
+            return SubmitResponse(
+                publication_id=req.publication_id,
+                task_id=req.task_id,
+                state=final_state,
+                queries_used=new_queries_used,
+                temperature=float(outcome.temperature),
+                warning=outcome.warning,
+                overheated=overheated,
+                publication_completed=False,
+            )
+        pub = {
+            "asic_model": pub_row["asic_model"],
+            "target": pub_row["target"],
+            "total_tasks_expected": pub_row.get("total_tasks_expected"),
+        }
 
-        expected = conn.execute(
-            """
-            SELECT COUNT(*) AS n
-            FROM tasks
-            WHERE asic_model=? AND target=?
-              AND creator_version=? AND schema_version=?
-              AND status='open'
-            """,
-            (pub["asic_model"], pub["target"], TASK_CREATOR_VERSION, DB_SCHEMA_VERSION),
+        assign_total = conn.execute(
+            "SELECT COUNT(*) AS n FROM assignments WHERE publication_id=?",
+            (req.publication_id,),
         ).fetchone()["n"]
-
+        active_cnt = conn.execute(
+            "SELECT COUNT(*) AS n FROM assignments WHERE publication_id=? AND state='active'",
+            (req.publication_id,),
+        ).fetchone()["n"]
         closed = conn.execute(
             """
             SELECT COUNT(*) AS n
@@ -499,7 +599,27 @@ async def submit_task(request: Request) -> SubmitResponse:
         ).fetchone()["n"]
 
         publication_completed = False
-        if int(closed) >= int(expected) and int(expected) > 0:
+        snap = pub.get("total_tasks_expected")
+        if snap is not None and int(snap) > 0:
+            # Primary: snapshot from publication row (matches assignments claimed for this run).
+            if int(assign_total) == int(snap) and int(active_cnt) == 0 and int(closed) == int(assign_total):
+                publication_completed = True
+        if not publication_completed:
+            # Legacy rows without snapshot: compare closed to live pool size (can fail if pool grew).
+            expected = conn.execute(
+                """
+                SELECT COUNT(*) AS n
+                FROM tasks
+                WHERE asic_model=? AND target=?
+                  AND creator_version=? AND schema_version=?
+                  AND status='open'
+                """,
+                (pub["asic_model"], pub["target"], TASK_CREATOR_VERSION, DB_SCHEMA_VERSION),
+            ).fetchone()["n"]
+            if int(closed) >= int(expected) and int(expected) > 0:
+                publication_completed = True
+
+        if publication_completed:
             avg = conn.execute(
                 "SELECT AVG(net_profit) AS avg FROM assignments WHERE publication_id=?",
                 (req.publication_id,),
@@ -512,7 +632,11 @@ async def submit_task(request: Request) -> SubmitResponse:
                 """,
                 (avg, now_iso, req.publication_id),
             )
-            publication_completed = True
+            logger.info(
+                "publication %s completed (submit path) avg_net_profit=%s",
+                req.publication_id,
+                avg,
+            )
 
         return SubmitResponse(
             publication_id=req.publication_id,
