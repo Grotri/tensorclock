@@ -27,6 +27,10 @@ from virtual_device_generator import VirtualDeviceGenerator
 from asic_physics_simulator import AmbientTemperatureLevel
 from version import DB_SCHEMA_VERSION, TASK_CREATOR_VERSION
 
+# Canonical bundle size: one open task per (device, ambient_level) for generate_miner_task_bundle.
+DEFAULT_BUNDLE_DEVICE_COUNT = 5
+EXPECTED_TASKS_PER_PUBLICATION = DEFAULT_BUNDLE_DEVICE_COUNT * len(AmbientTemperatureLevel)
+
 
 OptimizationTarget = Literal["efficiency", "hashrate", "balanced"]
 
@@ -301,7 +305,7 @@ def _ensure_tasks(
 
 def generate_miner_task_bundle(
     asic_model: str = "Antminer S19",
-    devices_count: int = 5,
+    devices_count: int = DEFAULT_BUNDLE_DEVICE_COUNT,
     query_budget: int = 10,
     target: OptimizationTarget = "efficiency",
     db_path: Path | str = _default_db_path(),

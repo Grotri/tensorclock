@@ -24,7 +24,11 @@ from publication_expiry import (
     effective_publication_deadline,
     expire_publication_if_overdue,
 )
-from task_manager import ELECTRICITY_PRICE_MAX, ELECTRICITY_PRICE_MIN  # noqa: F401
+from task_manager import (
+    ELECTRICITY_PRICE_MAX,
+    ELECTRICITY_PRICE_MIN,  # noqa: F401
+    EXPECTED_TASKS_PER_PUBLICATION,
+)
 from version import DB_SCHEMA_VERSION, TASK_CREATOR_VERSION
 from virtual_device_generator import VirtualDeviceGenerator
 
@@ -218,17 +222,9 @@ async def claim_task(request: Request) -> ClaimResponse:
             )
             model_description_json = json.dumps(req.model_description_json) if req.model_description_json is not None else None
             pub_deadline_iso = deadline_iso_from_now()
-            # Snapshot of how many pool tasks exist for this model/target at publication start.
-            # Submit completion compares assignment count to this (not live COUNT(tasks), which can grow and block completion).
-            snap = conn.execute(
-                """
-                SELECT COUNT(*) AS n FROM tasks
-                WHERE asic_model = ? AND target = ? AND status = 'open'
-                  AND creator_version = ? AND schema_version = ?
-                """,
-                (req.asic_model, req.target, TASK_CREATOR_VERSION, DB_SCHEMA_VERSION),
-            ).fetchone()
-            total_tasks_expected = int(snap["n"]) if snap and snap.get("n") is not None else 0
+            # Fixed to the canonical bundle size (5 devices × 5 ambient levels), not COUNT(tasks):
+            # the pool may contain extra open rows from older devices; publications must not include those.
+            total_tasks_expected = EXPECTED_TASKS_PER_PUBLICATION
             conn.execute(
                 """
                 INSERT INTO publications (
@@ -598,26 +594,18 @@ async def submit_task(request: Request) -> SubmitResponse:
             (req.publication_id,),
         ).fetchone()["n"]
 
-        publication_completed = False
         snap = pub.get("total_tasks_expected")
-        if snap is not None and int(snap) > 0:
-            # Primary: snapshot from publication row (matches assignments claimed for this run).
-            if int(assign_total) == int(snap) and int(active_cnt) == 0 and int(closed) == int(assign_total):
-                publication_completed = True
-        if not publication_completed:
-            # Legacy rows without snapshot: compare closed to live pool size (can fail if pool grew).
-            expected = conn.execute(
-                """
-                SELECT COUNT(*) AS n
-                FROM tasks
-                WHERE asic_model=? AND target=?
-                  AND creator_version=? AND schema_version=?
-                  AND status='open'
-                """,
-                (pub["asic_model"], pub["target"], TASK_CREATOR_VERSION, DB_SCHEMA_VERSION),
-            ).fetchone()["n"]
-            if int(closed) >= int(expected) and int(expected) > 0:
-                publication_completed = True
+        expected = (
+            int(snap)
+            if snap is not None and int(snap) > 0
+            else EXPECTED_TASKS_PER_PUBLICATION
+        )
+        publication_completed = (
+            int(expected) > 0
+            and int(assign_total) == int(expected)
+            and int(active_cnt) == 0
+            and int(closed) == int(assign_total)
+        )
 
         if publication_completed:
             avg = conn.execute(
