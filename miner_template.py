@@ -4,7 +4,9 @@ TensorClock miner template (model plug-in + validator discovery via Bittensor).
 Contract alignment:
   - validator API: see `validator_api.py` (`POST /task`, `POST /task/submit`, `GET /health`)
   - `POST /task` includes `publication_deadline_at` (wall-clock); **410 Gone** if that publication is past deadline
-  - optional Epistula signing on POST bodies (see `epistula.py`, `EPISTULA_REQUIRED` on validator)
+  - Epistula signing on POST bodies (see `epistula.py`); validators default to ``EPISTULA_REQUIRED=true``
+    (set ``EPISTULA_REQUIRED=false`` only for local dev). Pass a ``Wallet`` to ``ValidatorClient`` so
+    ``/task`` and ``/task/submit`` are signed with sorted JSON bytes matching the server hash.
   - endpoint discovery: per-UID ``subtensor.get_commitment``; see ``_get_commitment_quiet`` (SDK otherwise logs
     ERROR on UIDs with empty/broken commitment metadata — not a TensorClock bug), then **every** live validator
   - optional stake filter: `min_validator_stake` vs `metagraph.S[uid]` (default 0)

@@ -39,13 +39,19 @@ app = FastAPI(title="TensorClock Validator API")
 
 def _epistula_required() -> bool:
     """When true, POST bodies must include valid Epistula headers (miner hotkey signature)."""
-    return os.getenv("EPISTULA_REQUIRED", "false").strip().lower() in ("1", "true", "yes")
+    raw = os.getenv("EPISTULA_REQUIRED", "true").strip().lower()
+    if raw in ("0", "false", "no", "off", ""):
+        return False
+    return True
 
 
-async def _read_body_with_optional_epistula(request: Request) -> bytes:
+async def _read_body_with_optional_epistula(request: Request) -> tuple[bytes, Optional[str]]:
+    """
+    Return raw body and, when Epistula is required, the verified signer SS58 (else None).
+    """
     body = await request.body()
     if not _epistula_required():
-        return body
+        return body, None
     from epistula import verify_epistula_request
 
     try:
@@ -53,7 +59,7 @@ async def _read_body_with_optional_epistula(request: Request) -> bytes:
     except ValueError as e:
         raise HTTPException(status_code=401, detail=str(e)) from e
     logger.debug("Epistula OK hotkey=%s", hk)
-    return body
+    return body, str(hk)
 
 
 class ClaimRequest(BaseModel):
@@ -206,20 +212,16 @@ async def health() -> dict[str, str]:
 
 @app.post("/task", response_model=ClaimResponse)
 async def claim_task(request: Request) -> ClaimResponse:
-    body = await _read_body_with_optional_epistula(request)
+    body, verified_signer_hk = await _read_body_with_optional_epistula(request)
     req = ClaimRequest.model_validate_json(body)
     hk_claim = str(req.miner_hotkey).strip()
     if not hk_claim:
         raise HTTPException(status_code=422, detail="miner_hotkey must be non-empty")
-    if _epistula_required():
-        from epistula import verify_epistula_request
-
-        hk_sig = verify_epistula_request(headers=request.headers, body=body)
-        if hk_sig.strip() != hk_claim:
-            raise HTTPException(
-                status_code=403,
-                detail="miner_hotkey must match Epistula signing hotkey (X-Epistula-Hotkey)",
-            )
+    if verified_signer_hk is not None and verified_signer_hk.strip() != hk_claim:
+        raise HTTPException(
+            status_code=403,
+            detail="miner_hotkey must match Epistula signing hotkey (X-Epistula-Hotkey)",
+        )
     state = _get_state()
     now_iso = _now_iso()
 
@@ -399,7 +401,7 @@ async def claim_task(request: Request) -> ClaimResponse:
 
 @app.post("/task/submit", response_model=SubmitResponse)
 async def submit_task(request: Request) -> SubmitResponse:
-    body = await _read_body_with_optional_epistula(request)
+    body, _verified_hk = await _read_body_with_optional_epistula(request)
     req = SubmitRequest.model_validate_json(body)
     state = _get_state()
     now_iso = _now_iso()

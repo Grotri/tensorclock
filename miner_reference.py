@@ -9,8 +9,9 @@ when a wallet is configured.
 Requirements:
   - Bittensor network access for discovery + commitments
   - Validators committed HTTP endpoints on-chain
-  - When validator runs with ``EPISTULA_REQUIRED=true``, set wallet env
-    (``WALLET_NAME`` / ``HOTKEY_NAME``) so requests are signed.
+  - Validators default to requiring Epistula (``EPISTULA_REQUIRED=true``). Set
+    ``WALLET_NAME`` / ``HOTKEY_NAME`` (or equivalent) so requests are signed; use
+    ``EPISTULA_REQUIRED=false`` on the validator only for local testing.
 
 Full CLI reference: ``docs/miner_reference.md`` (or ``python miner_reference.py --help``).
 
@@ -207,7 +208,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     parser.add_argument(
         "--no-wallet",
         action="store_true",
-        help="Do not load wallet (only works if validator has EPISTULA_REQUIRED=false)",
+        help="Do not load wallet (requires validator EPISTULA_REQUIRED=false and MINER_HOTKEY for claim body only)",
     )
     parser.add_argument(
         "--miner-uid",
