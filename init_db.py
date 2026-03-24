@@ -216,7 +216,8 @@ def init_db(db_url: str | None = None) -> None:
                 completed_at TEXT NULL,
                 avg_net_profit double precision NULL,
                 publication_deadline_at TEXT NULL,
-                total_tasks_expected INTEGER NULL
+                total_tasks_expected INTEGER NULL,
+                miner_hotkey TEXT NULL
             );
             """
         )
@@ -289,6 +290,7 @@ def init_db(db_url: str | None = None) -> None:
         _ensure_column("tasks", "schema_version", "TEXT NOT NULL DEFAULT '0'")
         _ensure_column("publications", "publication_deadline_at", "TEXT NULL")
         _ensure_column("publications", "total_tasks_expected", "INTEGER NULL")
+        _ensure_column("publications", "miner_hotkey", "TEXT NULL")
 
         # Backfill deadline for existing publications (created_at + 10 minutes)
         conn.execute(

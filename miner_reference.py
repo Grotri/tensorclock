@@ -240,6 +240,16 @@ def main(argv: Optional[list[str]] = None) -> int:
         args.network, args.netuid, args.miner_uid, wallet
     )
 
+    if wallet is not None:
+        miner_hotkey_ss58 = str(wallet.hotkey.ss58_address)
+    else:
+        miner_hotkey_ss58 = os.getenv("MINER_HOTKEY", "").strip()
+        if not miner_hotkey_ss58:
+            logger.error(
+                "With --no-wallet, set MINER_HOTKEY to your miner hotkey SS58 (required by POST /task)."
+            )
+            return 1
+
     try:
         urls = _resolve_validator_urls(args)
     except Exception as e:
@@ -263,6 +273,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         if args.smoke:
             r = client.claim_task(
                 miner_uid=miner_uid,
+                miner_hotkey=miner_hotkey_ss58,
                 asic_model=args.asic_model,
                 target=args.target,
                 publication_id=None,
@@ -291,6 +302,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         result = runner.run_publication(
             model,
             miner_uid=miner_uid,
+            miner_hotkey=miner_hotkey_ss58,
             asic_model=args.asic_model,
             target=args.target,
             model_description_json={"model": "NominalS19MinerModel", "version": "1.0"},

@@ -58,6 +58,8 @@ async def _read_body_with_optional_epistula(request: Request) -> bytes:
 
 class ClaimRequest(BaseModel):
     miner_uid: int = Field(..., ge=0)
+    """SS58 hotkey of the miner's wallet (must match chain UID ↔ hotkey at weight time)."""
+    miner_hotkey: str = Field(..., min_length=1)
     asic_model: str
     target: str
     publication_id: Optional[str] = None
@@ -206,6 +208,18 @@ async def health() -> dict[str, str]:
 async def claim_task(request: Request) -> ClaimResponse:
     body = await _read_body_with_optional_epistula(request)
     req = ClaimRequest.model_validate_json(body)
+    hk_claim = str(req.miner_hotkey).strip()
+    if not hk_claim:
+        raise HTTPException(status_code=422, detail="miner_hotkey must be non-empty")
+    if _epistula_required():
+        from epistula import verify_epistula_request
+
+        hk_sig = verify_epistula_request(headers=request.headers, body=body)
+        if hk_sig.strip() != hk_claim:
+            raise HTTPException(
+                status_code=403,
+                detail="miner_hotkey must match Epistula signing hotkey (X-Epistula-Hotkey)",
+            )
     state = _get_state()
     now_iso = _now_iso()
 
@@ -228,15 +242,16 @@ async def claim_task(request: Request) -> ClaimResponse:
             conn.execute(
                 """
                 INSERT INTO publications (
-                    publication_id, miner_uid, asic_model, target, query_budget,
+                    publication_id, miner_uid, miner_hotkey, asic_model, target, query_budget,
                     tasks_creator_version, tasks_schema_version,
                     model_description_json,
                     state, created_at, publication_deadline_at, total_tasks_expected
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?)
                 """,
                 (
                     pub_id,
                     req.miner_uid,
+                    hk_claim,
                     req.asic_model,
                     req.target,
                     10,  # query_budget per task in MVP
@@ -252,7 +267,7 @@ async def claim_task(request: Request) -> ClaimResponse:
         # Validate publication ownership and status.
         pub_row = conn.execute(
             """
-            SELECT publication_id, miner_uid, asic_model, target, tasks_creator_version, tasks_schema_version,
+            SELECT publication_id, miner_uid, miner_hotkey, asic_model, target, tasks_creator_version, tasks_schema_version,
                    state, publication_deadline_at, created_at
             FROM publications WHERE publication_id = ?
             """,
@@ -262,11 +277,19 @@ async def claim_task(request: Request) -> ClaimResponse:
             raise HTTPException(status_code=404, detail="publication_id not found")
         if int(pub_row["miner_uid"]) != int(req.miner_uid):
             raise HTTPException(status_code=403, detail="publication_id does not belong to miner_uid")
+        stored_hk = pub_row.get("miner_hotkey")
+        if stored_hk is None or str(stored_hk).strip() == "":
+            conn.execute(
+                "UPDATE publications SET miner_hotkey=? WHERE publication_id=?",
+                (hk_claim, pub_id),
+            )
+        elif str(stored_hk).strip() != hk_claim:
+            raise HTTPException(status_code=403, detail="miner_hotkey does not match publication")
         if expire_publication_if_overdue(conn, pub_id, now_iso):
             raise HTTPException(status_code=410, detail="publication deadline expired")
         pub_row = conn.execute(
             """
-            SELECT publication_id, miner_uid, asic_model, target, tasks_creator_version, tasks_schema_version,
+            SELECT publication_id, miner_uid, miner_hotkey, asic_model, target, tasks_creator_version, tasks_schema_version,
                    state, publication_deadline_at, created_at
             FROM publications WHERE publication_id = ?
             """,

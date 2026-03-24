@@ -42,6 +42,95 @@ def _extrinsic_succeeded(resp: Any) -> bool:
     return False
 
 
+def _chain_hotkey_at_uid(metagraph: Any, uid: int) -> str:
+    """SS58 hotkey registered at ``uid`` on the synced metagraph (empty if out of range)."""
+    n = int(getattr(metagraph, "n", 0) or 0)
+    if uid < 0 or uid >= n:
+        return ""
+    hks = getattr(metagraph, "hotkeys", None)
+    if hks is None:
+        return ""
+    try:
+        return str(hks[uid]).strip()
+    except (IndexError, TypeError, KeyError):
+        return ""
+
+
+def _hotkey_matches_uid(metagraph: Any, uid: int, expected_hotkey: str | None) -> bool:
+    """True if ``expected_hotkey`` is set and equals the chain hotkey at ``uid`` (UID recycling safe)."""
+    if expected_hotkey is None:
+        return False
+    exp = str(expected_hotkey).strip()
+    if not exp:
+        return False
+    return _chain_hotkey_at_uid(metagraph, uid) == exp
+
+
+def _pick_winner_uid_from_completed(
+    conn: Any,
+    metagraph: Any,
+    *,
+    tasks_creator_version: str,
+    tasks_schema_version: str,
+) -> tuple[Optional[int], Optional[str]]:
+    """
+    Best completed publication whose miner_uid still maps to the stored miner_hotkey on-chain.
+    Skips legacy rows without miner_hotkey or UID/hotkey mismatch (deregistration / recycled UID).
+    """
+    rows = conn.execute(
+        """
+        SELECT miner_uid, miner_hotkey
+        FROM publications
+        WHERE state='completed'
+          AND tasks_creator_version = ?
+          AND tasks_schema_version = ?
+          AND miner_hotkey IS NOT NULL
+          AND TRIM(miner_hotkey) <> ''
+        ORDER BY avg_net_profit DESC NULLS LAST, completed_at ASC
+        LIMIT 64
+        """,
+        (tasks_creator_version, tasks_schema_version),
+    ).fetchall()
+    n = int(getattr(metagraph, "n", 0) or 0)
+    for row in rows:
+        uid = row.get("miner_uid")
+        hk = row.get("miner_hotkey")
+        if uid is None or hk is None:
+            continue
+        uid_i = int(uid)
+        if uid_i < 0 or uid_i >= n:
+            continue
+        if _hotkey_matches_uid(metagraph, uid_i, str(hk)):
+            return uid_i, str(hk).strip()
+
+    rows_fb = conn.execute(
+        """
+        SELECT miner_uid, miner_hotkey
+        FROM publications
+        WHERE state='completed'
+          AND miner_hotkey IS NOT NULL
+          AND TRIM(miner_hotkey) <> ''
+        ORDER BY completed_at DESC NULLS LAST, avg_net_profit DESC NULLS LAST
+        LIMIT 64
+        """,
+    ).fetchall()
+    for row in rows_fb:
+        uid = row.get("miner_uid")
+        hk = row.get("miner_hotkey")
+        if uid is None or hk is None:
+            continue
+        uid_i = int(uid)
+        if uid_i < 0 or uid_i >= n:
+            continue
+        if _hotkey_matches_uid(metagraph, uid_i, str(hk)):
+            logger.info(
+                "weights: using completed publication (version fallback) miner_uid=%s",
+                uid_i,
+            )
+            return uid_i, str(hk).strip()
+    return None, None
+
+
 def _extrinsic_detail(resp: Any) -> str:
     if resp is None:
         return "None"
@@ -272,44 +361,17 @@ def main(network: str, netuid: int, coldkey: str, hotkey: str, log_level: str):
                     time.sleep(12)
                     continue
 
-                # Winner-takes-all based on completed publications.
+                # Winner-takes-all: best completed publication whose stored hotkey still matches chain UID.
                 winner_uid: Optional[int] = None
+                winner_hotkey: Optional[str] = None
                 try:
                     with connect() as conn:
-                        row = conn.execute(
-                            """
-                            SELECT miner_uid
-                            FROM publications
-                            WHERE state='completed'
-                              AND tasks_creator_version = ?
-                              AND tasks_schema_version = ?
-                            ORDER BY avg_net_profit DESC NULLS LAST, completed_at ASC
-                            LIMIT 1
-                            """,
-                            (TASK_CREATOR_VERSION, DB_SCHEMA_VERSION),
-                        ).fetchone()
-                        if row is not None and row.get("miner_uid") is not None:
-                            winner_uid = int(row["miner_uid"])
-                        if winner_uid is None:
-                            row2 = conn.execute(
-                                """
-                                SELECT miner_uid, tasks_creator_version, tasks_schema_version, completed_at
-                                FROM publications
-                                WHERE state='completed'
-                                ORDER BY completed_at DESC NULLS LAST, avg_net_profit DESC NULLS LAST
-                                LIMIT 1
-                                """
-                            ).fetchone()
-                            if row2 is not None and row2.get("miner_uid") is not None:
-                                winner_uid = int(row2["miner_uid"])
-                                logger.info(
-                                    "weights: using latest completed publication (version fallback): "
-                                    "miner_uid=%s tasks_creator_version=%s tasks_schema_version=%s completed_at=%s",
-                                    winner_uid,
-                                    row2.get("tasks_creator_version"),
-                                    row2.get("tasks_schema_version"),
-                                    row2.get("completed_at"),
-                                )
+                        winner_uid, winner_hotkey = _pick_winner_uid_from_completed(
+                            conn,
+                            metagraph,
+                            tasks_creator_version=TASK_CREATOR_VERSION,
+                            tasks_schema_version=DB_SCHEMA_VERSION,
+                        )
                         if winner_uid is None:
                             stats = conn.execute(
                                 """
@@ -319,7 +381,8 @@ def main(network: str, netuid: int, coldkey: str, hotkey: str, log_level: str):
                                 """
                             ).fetchall()
                             logger.info(
-                                "weights: no completed publication for weights — counts by state: %s",
+                                "weights: no eligible winner (no completed row with miner_hotkey matching chain) — "
+                                "counts by state: %s",
                                 [(s.get("state"), s.get("n")) for s in stats],
                             )
                 except Exception as e:
@@ -327,7 +390,7 @@ def main(network: str, netuid: int, coldkey: str, hotkey: str, log_level: str):
 
                 if winner_uid is None:
                     logger.info(
-                        "weights: no winner (no state=completed row); skipping set_weights, advancing tick"
+                        "weights: no winner; skipping set_weights, advancing tick"
                     )
                     last_weight_tick_block = current_block
                     time.sleep(12)
@@ -338,6 +401,15 @@ def main(network: str, netuid: int, coldkey: str, hotkey: str, log_level: str):
                         "weights: winner miner_uid=%s out of range for metagraph n=%s; skipping, advancing tick",
                         winner_uid,
                         metagraph.n,
+                    )
+                    last_weight_tick_block = current_block
+                    time.sleep(12)
+                    continue
+
+                if not _hotkey_matches_uid(metagraph, winner_uid, winner_hotkey):
+                    logger.warning(
+                        "weights: hotkey check failed after pick (race?) uid=%s; skipping set_weights",
+                        winner_uid,
                     )
                     last_weight_tick_block = current_block
                     time.sleep(12)

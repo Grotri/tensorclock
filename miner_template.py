@@ -172,6 +172,7 @@ class ValidatorClient:
         self,
         *,
         miner_uid: int,
+        miner_hotkey: str,
         asic_model: str,
         target: str,
         publication_id: Optional[str] = None,
@@ -179,6 +180,7 @@ class ValidatorClient:
     ) -> requests.Response:
         body: dict[str, Any] = {
             "miner_uid": miner_uid,
+            "miner_hotkey": miner_hotkey,
             "asic_model": asic_model,
             "target": target,
         }
@@ -389,6 +391,7 @@ class MinerRunner:
         model: MinerModel,
         *,
         miner_uid: int,
+        miner_hotkey: str,
         asic_model: str,
         target: str,
         model_description_json: Optional[dict[str, Any]] = None,
@@ -406,6 +409,7 @@ class MinerRunner:
         while True:
             r = self.client.claim_task(
                 miner_uid=miner_uid,
+                miner_hotkey=miner_hotkey,
                 asic_model=asic_model,
                 target=target,
                 publication_id=publication_id,
