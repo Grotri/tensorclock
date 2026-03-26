@@ -14,7 +14,6 @@ database_url = ""
 sim_workers = 4
 
 # Task bundle generation at startup
-bundle_asic_model = "Antminer S19"
 bundle_devices_count = 5
 bundle_query_budget = 10
 bundle_target = "efficiency"

@@ -280,14 +280,24 @@ def main(argv: Optional[list[str]] = None):
 
         init_db()
         
-        generate_miner_task_bundle(
-            asic_model=str(cfg_get(cfg, "validator.bundle_asic_model", "Antminer S19")),
-            devices_count=int(cfg_get(cfg, "validator.bundle_devices_count", 5)),
-            query_budget=int(cfg_get(cfg, "validator.bundle_query_budget", 10)),
-            target=str(cfg_get(cfg, "validator.bundle_target", "efficiency")),
-        )
-
         from virtual_device_generator import VirtualDeviceGenerator
+        bootstrap_generator = VirtualDeviceGenerator()
+        bootstrap_generator.load_builtin_specifications()
+        supported_models = bootstrap_generator.get_available_models()
+        logger.info("Task bootstrap for supported ASIC models: %s", supported_models)
+        for model_name in supported_models:
+            bundle = generate_miner_task_bundle(
+                asic_model=str(model_name),
+                devices_count=int(cfg_get(cfg, "validator.bundle_devices_count", 5)),
+                query_budget=int(cfg_get(cfg, "validator.bundle_query_budget", 10)),
+                target=str(cfg_get(cfg, "validator.bundle_target", "efficiency")),
+            )
+            logger.info(
+                "Task bundle ensured for model=%s devices=%s tasks=%s",
+                model_name,
+                len(bundle.devices),
+                len(bundle.tasks),
+            )
 
         db_url = str(cfg_get(cfg, "validator.database_url", "")).strip()
         if not db_url:
@@ -296,8 +306,7 @@ def main(argv: Optional[list[str]] = None):
         logger.info("Fetching initial hashprice (required for scoring); may retry on API errors…")
         blocking_fetch_initial_hashprice(db_url)
 
-        generator = VirtualDeviceGenerator()
-        generator.load_builtin_specifications()
+        generator = bootstrap_generator
 
         sim_workers = int(cfg_get(cfg, "validator.sim_workers", 4))
         executor = ThreadPoolExecutor(max_workers=sim_workers)
