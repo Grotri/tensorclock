@@ -65,10 +65,11 @@ def _hotkey_matches_uid(metagraph: Any, uid: int, expected_hotkey: str | None) -
     return _chain_hotkey_at_uid(metagraph, uid) == exp
 
 
-def _pick_winner_uid_from_completed(
+def _pick_winner_uid_from_completed_for_model(
     conn: Any,
     metagraph: Any,
     *,
+    asic_model: str,
     tasks_creator_version: str,
     tasks_schema_version: str,
 ) -> tuple[Optional[int], Optional[str]]:
@@ -81,6 +82,7 @@ def _pick_winner_uid_from_completed(
         SELECT miner_uid, miner_hotkey
         FROM publications
         WHERE state='completed'
+          AND asic_model = ?
           AND tasks_creator_version = ?
           AND tasks_schema_version = ?
           AND miner_hotkey IS NOT NULL
@@ -88,7 +90,7 @@ def _pick_winner_uid_from_completed(
         ORDER BY dollar_value DESC NULLS LAST, avg_net_profit DESC NULLS LAST, completed_at ASC
         LIMIT 64
         """,
-        (tasks_creator_version, tasks_schema_version),
+        (asic_model, tasks_creator_version, tasks_schema_version),
     ).fetchall()
     n = int(getattr(metagraph, "n", 0) or 0)
     for row in rows:
@@ -107,11 +109,13 @@ def _pick_winner_uid_from_completed(
         SELECT miner_uid, miner_hotkey
         FROM publications
         WHERE state='completed'
+          AND asic_model = ?
           AND miner_hotkey IS NOT NULL
           AND TRIM(miner_hotkey) <> ''
         ORDER BY dollar_value DESC NULLS LAST, avg_net_profit DESC NULLS LAST, completed_at DESC NULLS LAST
         LIMIT 64
         """,
+        (asic_model,),
     ).fetchall()
     for row in rows_fb:
         uid = row.get("miner_uid")
@@ -156,25 +160,27 @@ def emit_incentive_weights(
     subtensor: Any,
     wallet: Wallet,
     netuid: int,
-    winner_uid: int,
+    winner_weights: dict[int, float],
     mev_protection: bool,
     wait_for_finalization: bool,
     block_time: float,
     period_blocks: Optional[int],
 ) -> Any:
     """
-    Push normalized weights (single winner → [1.0]) via Subtensor.set_weights.
+    Push model-split weights via Subtensor.set_weights.
 
     The SDK picks commit-timelocked vs direct mechanism weights from commit_reveal_enabled(netuid).
     Shape matches subnet-template style: wallet, netuid, uids, weights, wait_for_inclusion, optional period.
 
     Reference: https://github.com/opentensor/subnet-template/blob/main/validator.py
     """
+    uids_sorted = sorted(int(uid) for uid in winner_weights.keys())
+    weights_sorted = [float(winner_weights[uid]) for uid in uids_sorted]
     kwargs: dict[str, Any] = {
         "wallet": wallet,
         "netuid": netuid,
-        "uids": [winner_uid],
-        "weights": [1.0],
+        "uids": uids_sorted,
+        "weights": weights_sorted,
         "wait_for_inclusion": True,
         "wait_for_finalization": wait_for_finalization,
         "mev_protection": mev_protection,
@@ -405,18 +411,31 @@ def main(argv: Optional[list[str]] = None):
                     time.sleep(12)
                     continue
 
-                # Winner-takes-all: best completed publication whose stored hotkey still matches chain UID.
-                winner_uid: Optional[int] = None
-                winner_hotkey: Optional[str] = None
+                # Per-model winners: split emission evenly across supported models.
+                winner_weights: dict[int, float] = {}
+                winners_by_model: dict[str, int] = {}
                 try:
                     with connect() as conn:
-                        winner_uid, winner_hotkey = _pick_winner_uid_from_completed(
-                            conn,
-                            metagraph,
-                            tasks_creator_version=TASK_CREATOR_VERSION,
-                            tasks_schema_version=DB_SCHEMA_VERSION,
-                        )
-                        if winner_uid is None:
+                        model_count = max(1, len(supported_models))
+                        per_model_weight = 1.0 / float(model_count)
+                        for model_name in supported_models:
+                            winner_uid, winner_hotkey = _pick_winner_uid_from_completed_for_model(
+                                conn,
+                                metagraph,
+                                asic_model=str(model_name),
+                                tasks_creator_version=TASK_CREATOR_VERSION,
+                                tasks_schema_version=DB_SCHEMA_VERSION,
+                            )
+                            if winner_uid is None:
+                                continue
+                            if winner_uid < 0 or winner_uid >= int(metagraph.n):
+                                continue
+                            if not _hotkey_matches_uid(metagraph, winner_uid, winner_hotkey):
+                                continue
+                            winner_weights[winner_uid] = float(winner_weights.get(winner_uid, 0.0)) + per_model_weight
+                            winners_by_model[str(model_name)] = int(winner_uid)
+
+                        if not winner_weights:
                             stats = conn.execute(
                                 """
                                 SELECT state, COUNT(*) AS n
@@ -432,28 +451,9 @@ def main(argv: Optional[list[str]] = None):
                 except Exception as e:
                     logger.error("Failed to pick winner from DB: %s", e)
 
-                if winner_uid is None:
+                if not winner_weights:
                     logger.info(
                         "weights: no winner; skipping set_weights, advancing tick"
-                    )
-                    last_weight_tick_block = current_block
-                    time.sleep(12)
-                    continue
-
-                if winner_uid < 0 or winner_uid >= int(metagraph.n):
-                    logger.error(
-                        "weights: winner miner_uid=%s out of range for metagraph n=%s; skipping, advancing tick",
-                        winner_uid,
-                        metagraph.n,
-                    )
-                    last_weight_tick_block = current_block
-                    time.sleep(12)
-                    continue
-
-                if not _hotkey_matches_uid(metagraph, winner_uid, winner_hotkey):
-                    logger.warning(
-                        "weights: hotkey check failed after pick (race?) uid=%s; skipping set_weights",
-                        winner_uid,
                     )
                     last_weight_tick_block = current_block
                     time.sleep(12)
@@ -475,9 +475,10 @@ def main(argv: Optional[list[str]] = None):
                     continue
 
                 logger.info(
-                    "weights: emit_incentive_weights(netuid=%s, winner_uid=%s, mev_protection=%s, period=%s)",
+                    "weights: emit_incentive_weights(netuid=%s, winners=%s, weights=%s, mev_protection=%s, period=%s)",
                     netuid,
-                    winner_uid,
+                    winners_by_model,
+                    winner_weights,
                     mev_on,
                     tx_period_i if tx_period_i is not None else "sdk_default",
                 )
@@ -486,7 +487,7 @@ def main(argv: Optional[list[str]] = None):
                     subtensor=subtensor,
                     wallet=wallet,
                     netuid=netuid,
-                    winner_uid=winner_uid,
+                    winner_weights=winner_weights,
                     mev_protection=mev_on,
                     wait_for_finalization=wait_fin,
                     block_time=weight_block_time,
@@ -497,8 +498,8 @@ def main(argv: Optional[list[str]] = None):
                 if _extrinsic_succeeded(resp):
                     last_weight_fail_time = 0.0
                     logger.info(
-                        "set_weights OK — miner_uid=%s validator_uid=%s detail=%s",
-                        winner_uid,
+                        "set_weights OK — winner_weights=%s validator_uid=%s detail=%s",
+                        winner_weights,
                         my_uid,
                         _extrinsic_detail(resp),
                     )
