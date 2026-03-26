@@ -32,12 +32,12 @@ from __future__ import annotations
 
 import argparse
 import logging
-import os
 import sys
+import os
 from typing import List, Optional, Union
 
 from bittensor_wallet import Wallet
-from dotenv import load_dotenv
+from config_utils import cfg_get, load_toml_config
 
 from miner_template import (
     MinerModel,
@@ -212,24 +212,33 @@ def _resolve_validator_urls(args: argparse.Namespace) -> List[str]:
 
 
 def main(argv: Optional[list[str]] = None) -> int:
-    load_dotenv()
+    bootstrap = argparse.ArgumentParser(add_help=False)
+    bootstrap.add_argument("--config", default="configs/miner_config.toml")
+    boot_args, _ = bootstrap.parse_known_args(argv)
+    cfg = load_toml_config(boot_args.config)
+
     configure_logging()
 
     parser = argparse.ArgumentParser(description="TensorClock reference miner")
     parser.add_argument(
+        "--config",
+        default=boot_args.config,
+        help="Path to miner TOML config (default: configs/miner_config.toml)",
+    )
+    parser.add_argument(
         "--validator-url",
-        default=os.getenv("VALIDATOR_URL", "").strip(),
+        default=str(cfg_get(cfg, "miner.validator_url", "")),
         help="Optional single-validator override. If empty, discover all validators on-chain.",
     )
     parser.add_argument(
         "--network",
-        default=os.getenv("NETWORK", "finney"),
+        default=str(cfg_get(cfg, "miner.network", "finney")),
         help="Bittensor network (finney, test, local)",
     )
     parser.add_argument(
         "--netuid",
         type=int,
-        default=int(os.getenv("NETUID", "1")),
+        default=int(cfg_get(cfg, "miner.netuid", 1)),
         help="Subnet netuid used for commitment discovery",
     )
     parser.add_argument(
@@ -237,7 +246,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         "--min-validator-stake",
         dest="blacklist_validator_min_stake",
         type=float,
-        default=_env_float("BLACKLIST_VALIDATOR_MIN_STAKE", "MIN_VALIDATOR_STAKE", default=-1.0),
+        default=float(cfg_get(cfg, "miner.blacklist_validator_min_stake", -1.0)),
         help=(
             "Skip validators with metagraph S[uid] <= this (synth-subnet rule). "
             "Default -1 disables the filter (needed for zero-stake local dev). Use 0 on mainnet."
@@ -247,45 +256,47 @@ def main(argv: Optional[list[str]] = None) -> int:
         "--blacklist.force_validator_permit",
         dest="blacklist_force_validator_permit",
         type=_str2bool,
-        default=_env_bool("BLACKLIST_FORCE_VALIDATOR_PERMIT", default=True),
+        default=bool(cfg_get(cfg, "miner.blacklist_force_validator_permit", True)),
         help=(
             "If true, only UIDs with validator_permit. Default true; on local dev set false if discovery finds nothing."
         ),
     )
     parser.add_argument(
         "--wallet-name",
-        default=os.getenv("WALLET_NAME", "default"),
+        default=str(cfg_get(cfg, "miner.wallet_name", "default")),
         help="Coldkey / wallet name for Epistula signing",
     )
     parser.add_argument(
         "--hotkey-name",
-        default=os.getenv("HOTKEY_NAME", "default"),
+        default=str(cfg_get(cfg, "miner.hotkey_name", "default")),
         help="Hotkey name for Epistula signing",
     )
     parser.add_argument(
         "--no-wallet",
         action="store_true",
+        default=bool(cfg_get(cfg, "miner.no_wallet", False)),
         help="Do not load wallet (requires validator EPISTULA_REQUIRED=false and MINER_HOTKEY for claim body only)",
     )
     parser.add_argument(
         "--miner-uid",
         type=int,
-        default=int(os.getenv("MINER_UID", "0")),
+        default=int(cfg_get(cfg, "miner.miner_uid", 0)),
         help="UID label stored in validator assignments (default: env MINER_UID or 0)",
     )
     parser.add_argument(
         "--asic-model",
-        default=os.getenv("ASIC_MODEL", "Antminer S19"),
+        default=str(cfg_get(cfg, "miner.asic_model", "Antminer S19")),
         help="Must match tasks in DB (default: Antminer S19)",
     )
     parser.add_argument(
         "--target",
-        default=os.getenv("MINER_TARGET", "efficiency"),
+        default=str(cfg_get(cfg, "miner.target", "efficiency")),
         help="Optimization target (default: efficiency)",
     )
     parser.add_argument(
         "--smoke",
         action="store_true",
+        default=bool(cfg_get(cfg, "miner.smoke", False)),
         help="Stop after the first successful task submit on the first validator (faster sanity check)",
     )
     args = parser.parse_args(argv)
@@ -301,10 +312,10 @@ def main(argv: Optional[list[str]] = None) -> int:
     if wallet is not None:
         miner_hotkey_ss58 = str(wallet.hotkey.ss58_address)
     else:
-        miner_hotkey_ss58 = os.getenv("MINER_HOTKEY", "").strip()
+        miner_hotkey_ss58 = str(cfg_get(cfg, "miner.miner_hotkey", "")).strip()
         if not miner_hotkey_ss58:
             logger.error(
-                "With --no-wallet, set MINER_HOTKEY to your miner hotkey SS58 (required by POST /task)."
+                "With --no-wallet, set miner.miner_hotkey in config to your miner hotkey SS58."
             )
             return 1
 

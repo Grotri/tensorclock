@@ -1,6 +1,6 @@
 import os
 import time
-import click
+import argparse
 import logging
 from urllib.parse import urlparse
 import bittensor as bt
@@ -28,6 +28,7 @@ from scoring_hashprice import blocking_fetch_initial_hashprice
 from task_manager import generate_miner_task_bundle
 from validator_api import app, init_validator_api
 from version import DB_SCHEMA_VERSION, TASK_CREATOR_VERSION
+from config_utils import cfg_get, load_toml_config
 
 
 def _extrinsic_succeeded(resp: Any) -> bool:
@@ -195,59 +196,55 @@ def heartbeat_monitor(last_heartbeat, stop_event):
             logger.error("No heartbeat detected in the last 600 seconds. Restarting process.")
             logging.shutdown(); os.execv(sys.executable, [sys.executable] + sys.argv)
 
-@click.command()
-@click.option(
-    "--network",
-    default=lambda: os.getenv("NETWORK", "finney"),
-    help="Network to connect to (finney, test, local)",
-)
-@click.option(
-    "--netuid",
-    type=int,
-    default=lambda: int(os.getenv("NETUID", "1")),
-    help="Subnet netuid",
-)
-@click.option(
-    "--coldkey",
-    default=lambda: os.getenv("WALLET_NAME", "default"),
-    help="Wallet name",
-)
-@click.option(
-    "--hotkey",
-    default=lambda: os.getenv("HOTKEY_NAME", "default"),
-    help="Hotkey name",
-)
-@click.option(
-    "--log-level",
-    type=click.Choice(["DEBUG", "INFO", "WARNING", "ERROR"], case_sensitive=False),
-    default=lambda: os.getenv("LOG_LEVEL", "INFO"),
-    help="Logging level",
-)
-@click.option(
-    "--api-port",
-    type=int,
-    default=None,
-    help="HTTP port for the validator API (default: VALIDATOR_API_PORT or 8090). Use another port for a second local validator.",
-)
-@click.option(
-    "--validator-api-url",
-    "validator_api_url",
-    default=None,
-    help=(
-        "Optional full base URL for documentation/testing; only the port is used for binding, "
-        "e.g. http://127.0.0.1:8091. Overrides --api-port and VALIDATOR_API_PORT when set."
-    ),
-)
-def main(
-    network: str,
-    netuid: int,
-    coldkey: str,
-    hotkey: str,
-    log_level: str,
-    api_port: Optional[int],
-    validator_api_url: Optional[str],
-):
+def main(argv: Optional[list[str]] = None):
     """Run the Chi subnet validator."""
+    bootstrap = argparse.ArgumentParser(add_help=False)
+    bootstrap.add_argument("--config", default="configs/validator_config.toml")
+    boot_args, _ = bootstrap.parse_known_args(argv)
+    cfg = load_toml_config(boot_args.config)
+
+    parser = argparse.ArgumentParser(description="Run TensorClock validator")
+    parser.add_argument("--config", default=boot_args.config, help="Path to validator TOML config")
+    parser.add_argument("--network", default=str(cfg_get(cfg, "validator.network", "finney")))
+    parser.add_argument("--netuid", type=int, default=int(cfg_get(cfg, "validator.netuid", 1)))
+    parser.add_argument("--coldkey", default=str(cfg_get(cfg, "validator.wallet_name", "default")))
+    parser.add_argument("--hotkey", default=str(cfg_get(cfg, "validator.hotkey_name", "default")))
+    parser.add_argument("--log-level", default=str(cfg_get(cfg, "validator.log_level", "INFO")))
+    parser.add_argument("--api-port", type=int, default=int(cfg_get(cfg, "validator.api_port", 8090)))
+    parser.add_argument("--validator-api-url", default=str(cfg_get(cfg, "validator.validator_api_url", "")).strip())
+    args = parser.parse_args(argv)
+
+    network = args.network
+    netuid = int(args.netuid)
+    coldkey = args.coldkey
+    hotkey = args.hotkey
+    log_level = args.log_level
+    api_port = int(args.api_port)
+    validator_api_url = args.validator_api_url or None
+
+    # Push config into env for shared modules that read runtime flags.
+    env_pairs = {
+        "DATABASE_URL": str(cfg_get(cfg, "validator.database_url", "")).strip(),
+        "VALIDATOR_SIM_WORKERS": str(cfg_get(cfg, "validator.sim_workers", 4)),
+        "VALIDATOR_API_PORT": str(cfg_get(cfg, "validator.api_port", 8090)),
+        "EPISTULA_REQUIRED": "true" if bool(cfg_get(cfg, "validator.epistula_required", True)) else "false",
+        "PUBLICATION_DEADLINE_SECONDS": str(cfg_get(cfg, "validator.publication_deadline_seconds", 600)),
+        "PUBLICATION_EXPIRE_SWEEP_INTERVAL_SEC": str(cfg_get(cfg, "validator.publication_expire_sweep_interval_sec", 30)),
+        "PUBLICATION_EXPIRE_SWEEP_BATCH_LIMIT": str(cfg_get(cfg, "validator.publication_expire_sweep_batch_limit", 100)),
+        "HASHPRICE_TTL_SEC": str(cfg_get(cfg, "validator.hashprice_ttl_sec", 5 * 3600)),
+        "MEMPOOL_API_BASE": str(cfg_get(cfg, "validator.mempool_api_base", "https://mempool.space/api/v1/mining/hashrate")),
+        "VALIDATOR_MEV_PROTECTION": "true" if bool(cfg_get(cfg, "validator.weight_mev_protection", False)) else "false",
+        "VALIDATOR_WAIT_FOR_FINALIZATION": "true"
+        if bool(cfg_get(cfg, "validator.weight_wait_for_finalization", True))
+        else "false",
+        "VALIDATOR_WEIGHT_FAIL_COOLDOWN_SEC": str(cfg_get(cfg, "validator.weight_fail_cooldown_sec", 120)),
+        "VALIDATOR_WEIGHT_TX_PERIOD_BLOCKS": str(cfg_get(cfg, "validator.weight_tx_period_blocks", 0)),
+        "VALIDATOR_WEIGHT_BLOCK_TIME_SEC": str(cfg_get(cfg, "validator.weight_block_time_sec", 12.0)),
+    }
+    for k, v in env_pairs.items():
+        if v != "":
+            os.environ[k] = v
+
     # Set log level
     logging.getLogger().setLevel(getattr(logging, log_level.upper()))
     logger.info(f"Starting validator on network={network}, netuid={netuid}")
@@ -284,15 +281,15 @@ def main(
         init_db()
         
         generate_miner_task_bundle(
-            asic_model="Antminer S19",
-            devices_count=5,
-            query_budget=10,
-            target="efficiency",
+            asic_model=str(cfg_get(cfg, "validator.bundle_asic_model", "Antminer S19")),
+            devices_count=int(cfg_get(cfg, "validator.bundle_devices_count", 5)),
+            query_budget=int(cfg_get(cfg, "validator.bundle_query_budget", 10)),
+            target=str(cfg_get(cfg, "validator.bundle_target", "efficiency")),
         )
 
         from virtual_device_generator import VirtualDeviceGenerator
 
-        db_url = os.getenv("DATABASE_URL", "").strip()
+        db_url = str(cfg_get(cfg, "validator.database_url", "")).strip()
         if not db_url:
             raise RuntimeError("DATABASE_URL is required to run the validator with PostgreSQL.")
 
@@ -302,7 +299,7 @@ def main(
         generator = VirtualDeviceGenerator()
         generator.load_builtin_specifications()
 
-        sim_workers = int(os.getenv("VALIDATOR_SIM_WORKERS", "4"))
+        sim_workers = int(cfg_get(cfg, "validator.sim_workers", 4))
         executor = ThreadPoolExecutor(max_workers=sim_workers)
         init_validator_api(db_url=db_url, generator=generator, executor=executor)
 
@@ -328,7 +325,7 @@ def main(
         elif api_port is not None:
             listen_port = int(api_port)
         else:
-            listen_port = int(os.getenv("VALIDATOR_API_PORT", "8090"))
+            listen_port = int(cfg_get(cfg, "validator.api_port", 8090))
         server = uvicorn.Server(uvicorn.Config(app, host="0.0.0.0", port=listen_port, log_level="info"))
         threading.Thread(target=server.run, daemon=True).start()
         logger.info("Validator API listening on 0.0.0.0:%s (e.g. http://127.0.0.1:%s)", listen_port, listen_port)

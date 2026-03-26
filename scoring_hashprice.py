@@ -24,8 +24,9 @@ from version import DB_SCHEMA_VERSION, TASK_CREATOR_VERSION
 
 logger = logging.getLogger(__name__)
 
-# Refresh hashprice from mempool at most every this many seconds.
-HASHPRICE_TTL_SEC = int(os.getenv("HASHPRICE_TTL_SEC", str(5 * 3600)).strip() or str(5 * 3600))
+def _hashprice_ttl_sec() -> int:
+    raw = os.getenv("HASHPRICE_TTL_SEC", str(5 * 3600)).strip()
+    return int(raw or str(5 * 3600))
 
 _refresh_lock = threading.Lock()
 _refresh_thread: Optional[threading.Thread] = None
@@ -44,7 +45,7 @@ def is_hashprice_stale(updated_at_iso: str) -> bool:
     try:
         dt = _parse_iso_utc(updated_at_iso)
         age = (datetime.now(timezone.utc) - dt).total_seconds()
-        return age >= float(HASHPRICE_TTL_SEC)
+        return age >= float(_hashprice_ttl_sec())
     except Exception:
         return True
 
@@ -264,7 +265,6 @@ def schedule_hashprice_refresh_if_stale(db_url: str) -> None:
 
 
 __all__ = [
-    "HASHPRICE_TTL_SEC",
     "apply_scores_after_assignment_update",
     "apply_scores_after_publication_completed",
     "blocking_fetch_initial_hashprice",
