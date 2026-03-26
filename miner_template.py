@@ -29,6 +29,7 @@ import requests
 from bittensor_wallet import Wallet
 
 from epistula import merge_headers, sign_epistula_request_body
+from logging_utils import setup_logging
 
 logger = logging.getLogger(__name__)
 
@@ -393,8 +394,7 @@ def discover_validator_endpoints(
     if not out:
         logger.error(
             "Validator discovery: no live endpoints (netuid=%s n=%s). Skipped: permit=%s stake=%s "
-            "no_commitment=%s health_fail=%s. Try --validator-url, --min-validator-stake -1, "
-            "or --blacklist.force_validator_permit false on local chains.",
+            "no_commitment=%s health_fail=%s.",
             netuid,
             n,
             skip_permit,
@@ -572,4 +572,4 @@ class MinerRunner:
 
 
 def configure_logging(level: int = logging.INFO) -> None:
-    logging.basicConfig(level=level, format="%(asctime)s | %(levelname)s | %(message)s")
+    setup_logging(app_name="miner", level=level)

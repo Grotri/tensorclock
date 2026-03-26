@@ -1,4 +1,5 @@
 [miner]
+log_level = "INFO"
 network = "finney"
 netuid = 1
 validator_url = ""

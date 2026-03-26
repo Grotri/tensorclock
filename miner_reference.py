@@ -217,13 +217,16 @@ def main(argv: Optional[list[str]] = None) -> int:
     boot_args, _ = bootstrap.parse_known_args(argv)
     cfg = load_toml_config(boot_args.config)
 
-    configure_logging()
-
     parser = argparse.ArgumentParser(description="TensorClock reference miner")
     parser.add_argument(
         "--config",
         default=boot_args.config,
         help="Path to miner TOML config (default: configs/miner_config.toml)",
+    )
+    parser.add_argument(
+        "--log-level",
+        default=str(cfg_get(cfg, "miner.log_level", "INFO")),
+        help="Logging level (DEBUG, INFO, WARNING, ERROR)",
     )
     parser.add_argument(
         "--validator-url",
@@ -300,6 +303,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         help="Stop after the first successful task submit on the first validator (faster sanity check)",
     )
     args = parser.parse_args(argv)
+    configure_logging(level=getattr(logging, str(args.log_level).upper(), logging.INFO))
 
     wallet: Optional[Wallet] = None
     if not args.no_wallet:

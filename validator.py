@@ -12,11 +12,6 @@ from typing import Any, Optional
 
 import uvicorn
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
-)
 logger = logging.getLogger(__name__)
 
 HEARTBEAT_TIMEOUT = 600  # seconds
@@ -29,6 +24,7 @@ from task_manager import generate_miner_task_bundle
 from validator_api import app, init_validator_api
 from version import DB_SCHEMA_VERSION, TASK_CREATOR_VERSION
 from config_utils import cfg_get, load_toml_config
+from logging_utils import setup_logging, uvicorn_log_config
 
 
 def _extrinsic_succeeded(resp: Any) -> bool:
@@ -245,8 +241,8 @@ def main(argv: Optional[list[str]] = None):
         if v != "":
             os.environ[k] = v
 
-    # Set log level
-    logging.getLogger().setLevel(getattr(logging, log_level.upper()))
+    # Set unified SDK-style logging (console + dated file + latest file).
+    setup_logging(app_name="validator", level=log_level)
     logger.info(f"Starting validator on network={network}, netuid={netuid}")
 
     # Heartbeat setup
@@ -303,7 +299,7 @@ def main(argv: Optional[list[str]] = None):
         if not db_url:
             raise RuntimeError("DATABASE_URL is required to run the validator with PostgreSQL.")
 
-        logger.info("Fetching initial hashprice (required for scoring); may retry on API errors…")
+        logger.info("Fetching initial hashprice")
         blocking_fetch_initial_hashprice(db_url)
 
         generator = bootstrap_generator
@@ -319,10 +315,7 @@ def main(argv: Optional[list[str]] = None):
             name="publication-expiry-sweep",
         )
         pub_expiry_thread.start()
-        logger.info(
-            "Publication deadline sweep started (interval from PUBLICATION_EXPIRE_SWEEP_INTERVAL_SEC, "
-            "default 30s; batch cap PUBLICATION_EXPIRE_SWEEP_BATCH_LIMIT)"
-        )
+        logger.info("Publication deadline sweep started")
 
         if validator_api_url:
             parsed = urlparse(str(validator_api_url).strip())
@@ -335,7 +328,15 @@ def main(argv: Optional[list[str]] = None):
             listen_port = int(api_port)
         else:
             listen_port = int(cfg_get(cfg, "validator.api_port", 8090))
-        server = uvicorn.Server(uvicorn.Config(app, host="0.0.0.0", port=listen_port, log_level="info"))
+        server = uvicorn.Server(
+            uvicorn.Config(
+                app,
+                host="0.0.0.0",
+                port=listen_port,
+                log_level="info",
+                log_config=uvicorn_log_config(),
+            )
+        )
         threading.Thread(target=server.run, daemon=True).start()
         logger.info("Validator API listening on 0.0.0.0:%s (e.g. http://127.0.0.1:%s)", listen_port, listen_port)
 
@@ -343,8 +344,7 @@ def main(argv: Optional[list[str]] = None):
         mev_on = _env_bool("VALIDATOR_MEV_PROTECTION", default=False)
         if mev_on:
             logger.warning(
-                "VALIDATOR_MEV_PROTECTION=true: MEV Shield often breaks hotkey-signed set_weights; "
-                "prefer false unless you use a supported signing path."
+                "VALIDATOR_MEV_PROTECTION=true: MEV shield may fail with hotkey-signed set_weights."
             )
         wait_fin = _env_bool("VALIDATOR_WAIT_FOR_FINALIZATION", default=True)
         # After a failed set_weights, chain LastUpdate does not advance, so bslu stays high and we would
