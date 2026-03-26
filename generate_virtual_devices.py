@@ -1,19 +1,6 @@
-import random
-
 from init_db import init_db, connect, default_db_path
 from virtual_device_generator import VirtualDeviceGenerator
 from version import DEVICE_CREATOR_VERSION
-
-
-def generate_hidden_parameters(base_thermal_resistance: float) -> dict:
-    silicon_quality = random.uniform(0.92, 1.08)
-    degradation = random.uniform(0.0, 0.05)
-
-    return {
-        "silicon_quality": silicon_quality,
-        "degradation": degradation,
-        "thermal_resistance": base_thermal_resistance,
-    }
 
 
 def generate_virtual_devices_from_templates(
@@ -30,7 +17,6 @@ def generate_virtual_devices_from_templates(
     with connect(db_path) as conn:
         for model_name in generator.get_available_models():
             spec = generator._asic_models[model_name]
-            base_tr = spec.base_thermal_resistance
 
             print(f"\n[Model] {model_name} ({spec.nominal_hashrate} TH/s @ {spec.nominal_power} W)")
 

@@ -292,14 +292,9 @@ class VirtualDeviceGenerator:
 
         missing = max(0, count - len(valid_ids))
         for _ in range(missing):
-            base_tr = self._asic_models[asic_model].base_thermal_resistance
             device = self.generate_device(
                 model_name=asic_model,
-                hidden_params={
-                    "silicon_quality": 1.0,
-                    "degradation": 0.0,
-                    "thermal_resistance": base_tr,
-                },
+                hidden_params=self.sample_random_hidden_parameters(asic_model),
                 electricity_price=electricity_price,
                 apply_thermal_resistance_spread=True,
             )
@@ -325,7 +320,18 @@ class VirtualDeviceGenerator:
     
     def load_builtin_specifications(self) -> None:
         self.load_specifications_from_dict(get_builtin_asic_configurations())
-    
+
+    def sample_random_hidden_parameters(self, model_name: str) -> Dict[str, float]:
+        if model_name not in self._asic_models:
+            available = ", ".join(self.get_available_models())
+            raise ValueError(f"Model '{model_name}' not found. Available: {available}")
+        base_tr = self._asic_models[model_name].base_thermal_resistance
+        return {
+            "silicon_quality": random.uniform(0.92, 1.08),
+            "degradation": random.uniform(0.0, 0.05),
+            "thermal_resistance": base_tr,
+        }
+
     def generate_device(
         self,
         model_name: str,
@@ -518,4 +524,3 @@ def get_builtin_asic_configurations() -> Dict:
             },
         },
     }
-    

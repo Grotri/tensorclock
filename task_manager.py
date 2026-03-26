@@ -144,11 +144,7 @@ def _ensure_devices(
         remaining_prices.remove(electricity_price)
         device = generator.generate_device(
             model_name=asic_model,
-            hidden_params={
-                "silicon_quality": 1.0,
-                "degradation": 0.0,
-                "thermal_resistance": generator._asic_models[asic_model].base_thermal_resistance,
-            },
+            hidden_params=generator.sample_random_hidden_parameters(asic_model),
             electricity_price=electricity_price,
             apply_thermal_resistance_spread=True,
         )
