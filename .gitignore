@@ -12,3 +12,4 @@ docs/
 .cursorignore
 .cursor/
 knowledge/
+logs/
