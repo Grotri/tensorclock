@@ -1,11 +1,5 @@
 """
-Bitcoin hashprice from mempool.space public API (no API key).
-
-Computes expected miner revenue for **1 TH/s** over **24 hours** in BTC and USD,
-using current difficulty and average block reward (subsidy + fees) over a recent
-window of blocks.
-
-References (standard Bitcoin mining economics):
+References:
   expected BTC/s = hashrate_Hs * R_BTC_per_block / (difficulty * 2^32)
   where R includes coinbase subsidy and transaction fees for the block.
 """
@@ -20,14 +14,11 @@ from typing import Any, Final, Optional
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
-# Default public instance; override with MEMPOOL_API_BASE for self-hosted nodes.
 _DEFAULT_BASE: Final[str] = "https://mempool.space/api/v1"
 
 
 @dataclass(frozen=True)
 class HashpriceQuote:
-    """Snapshot of hashprice derived from mempool.space."""
-
     btc_per_th_per_day: float
     usd_per_th_per_day: float
     btc_usd: float
@@ -36,7 +27,7 @@ class HashpriceQuote:
     blocks_sampled: int
     start_block: int
     end_block: int
-    as_of: str  # ISO UTC when the quote was built
+    as_of: str
     api_base: str
 
 
@@ -60,12 +51,6 @@ def _get_json(path: str, *, timeout_s: float = 20.0) -> dict[str, Any]:
 
 
 def btc_per_th_per_day(difficulty: float, reward_btc_per_block: float) -> float:
-    """
-    Expected BTC earned in 24h for **1 TH/s** (1e12 H/s) at given difficulty.
-
-    Uses the usual relation: block discovery rate ≈ H / (D · 2^32) blocks/s,
-    times reward per block, times 86400 s/day.
-    """
     if difficulty <= 0:
         raise ValueError("difficulty must be positive")
     if reward_btc_per_block < 0:
@@ -75,7 +60,6 @@ def btc_per_th_per_day(difficulty: float, reward_btc_per_block: float) -> float:
 
 
 def _parse_reward_stats(data: dict[str, Any]) -> tuple[float, int, int, int]:
-    """Return (avg_reward_sats_per_block, n_blocks, start_block, end_block)."""
     try:
         start = int(data["startBlock"])
         end = int(data["endBlock"])
@@ -98,8 +82,6 @@ def fetch_hashprice_quote(
     timeout_s: float = 20.0,
 ) -> HashpriceQuote:
     """
-    Pull difficulty, rolling average reward, and BTC/USD from mempool.space and compute hashprice.
-
     ``reward_blocks`` — how many latest blocks to average (default 144 ≈ ~24h at 10 min/block).
     """
     if reward_blocks < 8:
@@ -146,10 +128,6 @@ def fetch_hashprice_quote(
 def fetch_hashprice_quote_safe(
     **kwargs: Any,
 ) -> Optional[HashpriceQuote]:
-    """
-    Same as :func:`fetch_hashprice_quote` but returns ``None`` on network/parsing errors
-    (HTTP, timeout, malformed JSON).
-    """
     try:
         return fetch_hashprice_quote(**kwargs)
     except (HTTPError, URLError, TimeoutError, ValueError, OSError) as e:

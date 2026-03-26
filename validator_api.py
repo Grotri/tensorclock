@@ -32,7 +32,7 @@ from scoring_hashprice import (
 )
 from task_manager import (
     ELECTRICITY_PRICE_MAX,
-    ELECTRICITY_PRICE_MIN,  # noqa: F401
+    ELECTRICITY_PRICE_MIN,
     EXPECTED_TASKS_PER_PUBLICATION,
 )
 from version import DB_SCHEMA_VERSION, TASK_CREATOR_VERSION
@@ -44,7 +44,6 @@ app = FastAPI(title="TensorClock Validator API")
 
 
 def _epistula_required() -> bool:
-    """When true, POST bodies must include valid Epistula headers (miner hotkey signature)."""
     raw = os.getenv("EPISTULA_REQUIRED", "true").strip().lower()
     if raw in ("0", "false", "no", "off", ""):
         return False
@@ -52,9 +51,6 @@ def _epistula_required() -> bool:
 
 
 async def _read_body_with_optional_epistula(request: Request) -> tuple[bytes, Optional[str]]:
-    """
-    Return raw body and, when Epistula is required, the verified signer SS58 (else None).
-    """
     body = await request.body()
     if not _epistula_required():
         return body, None
@@ -70,12 +66,10 @@ async def _read_body_with_optional_epistula(request: Request) -> tuple[bytes, Op
 
 class ClaimRequest(BaseModel):
     miner_uid: int = Field(..., ge=0)
-    """SS58 hotkey of the miner's wallet (must match chain UID ↔ hotkey at weight time)."""
     miner_hotkey: str = Field(..., min_length=1)
     asic_model: str
     target: str
     publication_id: Optional[str] = None
-    # Optional metadata; validator does not depend on it for scoring.
     model_description_json: Optional[dict[str, Any]] = None
 
 
@@ -143,13 +137,10 @@ class ValidatorState:
 def _get_state() -> ValidatorState:
     if not hasattr(app.state, "validator_state"):
         raise RuntimeError("Validator API not initialized (missing app.state.validator_state).")
-    return app.state.validator_state  # type: ignore[attr-defined]
+    return app.state.validator_state
 
 
 def init_validator_api(*, db_url: str, generator: VirtualDeviceGenerator, executor: Any) -> None:
-    """
-    Must be called by validator.py once at startup.
-    """
     app.state.validator_state = ValidatorState(
         db_url=db_url,
         generator=generator,
@@ -159,19 +150,11 @@ def init_validator_api(*, db_url: str, generator: VirtualDeviceGenerator, execut
 
 
 def _is_overheated(*, device: Any, temperature: float) -> bool:
-    # Hard rule: if temperature exceeds max safe temperature, task is immediately failed.
     limits = device.base_specification.hardware_limits
     return float(temperature) > float(limits.max_safe_temperature)
 
 
 def _try_finalize_publication_when_pool_exhausted(conn: Any, publication_id: str, now_iso: str) -> None:
-    """
-    When claim finds no next task (404), all work for this publication may still be done:
-    every pool task has a terminal assignment. In that case mark publication completed.
-
-    This closes the gap when submit-side completion did not fire (e.g. total_tasks_expected
-    snapshot != number of assignments actually claimed, or legacy expected pool COUNT drift).
-    """
     pub = conn.execute(
         "SELECT state FROM publications WHERE publication_id=? AND state='active'",
         (publication_id,),
@@ -225,12 +208,6 @@ def _run_simulation_sync(*, device: Any, ambient_level: AmbientTemperatureLevel,
 
 
 def _calculate_task_net_profit_usd_per_day(*, outcome: Any, electricity_price_usd_per_kwh: float, usd_per_th_day: float) -> float:
-    """
-    Task net revenue in USD/day:
-      gross_revenue = hashrate_th * usd_per_th_day
-      electricity_cost = (power_watts * 24 / 1000) * electricity_price_usd_per_kwh
-      net = gross_revenue - electricity_cost
-    """
     hashrate_th = float(outcome.hashrate)
     power_watts = float(outcome.power)
     gross_revenue_usd_day = hashrate_th * float(usd_per_th_day)
@@ -269,20 +246,15 @@ async def claim_task(request: Request) -> ClaimResponse:
 
     try:
         with connect(state.db_url) as conn:
-            # Create publication if needed.
             pub_id = req.publication_id
             if not pub_id:
                 pub_id = f"pub_{uuid.uuid4().hex}"
-                # Cancel in-flight / stale work only. Do NOT cancel `completed` rows — they are needed for
-                # on-chain weights and audit; a new run supersedes scoring by creating a fresh publication.
                 conn.execute(
                     "UPDATE publications SET state='cancelled', completed_at=? WHERE miner_uid=? AND publication_id <> ? AND state IN ('active','expired')",
                     (now_iso, req.miner_uid, pub_id),
                 )
                 model_description_json = json.dumps(req.model_description_json) if req.model_description_json is not None else None
                 pub_deadline_iso = deadline_iso_from_now()
-                # Fixed to the canonical bundle size (5 devices × 5 ambient levels), not COUNT(tasks):
-                # the pool may contain extra open rows from older devices; publications must not include those.
                 total_tasks_expected = EXPECTED_TASKS_PER_PUBLICATION
                 conn.execute(
                     """
@@ -299,7 +271,7 @@ async def claim_task(request: Request) -> ClaimResponse:
                         hk_claim,
                         req.asic_model,
                         req.target,
-                        10,  # query_budget per task in MVP
+                        10,
                         TASK_CREATOR_VERSION,
                         DB_SCHEMA_VERSION,
                         model_description_json,
@@ -309,7 +281,6 @@ async def claim_task(request: Request) -> ClaimResponse:
                     ),
                 )
 
-            # Validate publication ownership and status.
             pub_row = conn.execute(
                 """
                 SELECT publication_id, miner_uid, miner_hotkey, asic_model, target, tasks_creator_version, tasks_schema_version,
@@ -347,7 +318,6 @@ async def claim_task(request: Request) -> ClaimResponse:
                 )
             pub_deadline_response = effective_publication_deadline(pub_row)
 
-            # If miner already has an active assignment inside this publication, return the same task.
             active = conn.execute(
                 """
                 SELECT a.task_id, a.queries_used, a.query_budget, t.device_id, t.asic_model, t.ambient_level, t.target, t.expires_at
@@ -377,7 +347,6 @@ async def claim_task(request: Request) -> ClaimResponse:
                     queries_used=int(active["queries_used"]),
                 )
 
-            # Select next unique task for this publication.
             task = conn.execute(
                 """
                 SELECT t.task_id, t.device_id, t.asic_model, t.ambient_level, t.target, t.query_budget, t.expires_at
@@ -403,8 +372,6 @@ async def claim_task(request: Request) -> ClaimResponse:
 
             if task is None:
                 _try_finalize_publication_when_pool_exhausted(conn, pub_id, now_iso)
-                # Must commit before raising: DBConnection.__exit__ rolls back on exception, which would undo
-                # the UPDATE to state='completed' inside _try_finalize_publication_when_pool_exhausted.
                 conn.commit()
                 raise HTTPException(status_code=404, detail="No available tasks for this publication")
 
@@ -455,7 +422,6 @@ async def submit_task(request: Request) -> SubmitResponse:
     now_iso = _now_iso()
 
     try:
-        # Load assignment and task rows on the main thread (cheap DB reads).
         with connect(state.db_url) as conn:
             a = conn.execute(
                 """
@@ -511,13 +477,11 @@ async def submit_task(request: Request) -> SubmitResponse:
             if t is None:
                 raise HTTPException(status_code=404, detail="task not found")
         
-            # Load device for simulation (may be cached inside generator).
             with state.generator_lock:
                 device = state.generator.load_device_from_db(t["device_id"], conn)
         
-        ambient = AmbientTemperatureLevel[str(t["ambient_level"])]  # type: ignore[index]
+        ambient = AmbientTemperatureLevel[str(t["ambient_level"])]
         
-        # Run simulation in executor to keep API responsive.
         import asyncio
         
         future = state.executor.submit(
@@ -539,7 +503,6 @@ async def submit_task(request: Request) -> SubmitResponse:
             usd_per_th_day = get_cached_usd_per_th_day(conn)
             if usd_per_th_day is None:
                 raise HTTPException(status_code=503, detail="hashprice unavailable")
-            # Refresh assignment (queries_used) because we may have released the first connection.
             a2 = conn.execute(
                 """
                 SELECT query_budget, queries_used, state
@@ -583,8 +546,6 @@ async def submit_task(request: Request) -> SubmitResponse:
                     final_state = "active"
                     can_continue = True
             else:
-                # Any non-valid outcome is treated as an immediate task annulment,
-                # because simulator returned that at least one constraint was violated.
                 final_state = "failed"
                 failure_reason = outcome.warning or "invalid_limits"
                 net_profit = 0.0

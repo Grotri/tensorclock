@@ -14,9 +14,8 @@ import uvicorn
 
 logger = logging.getLogger(__name__)
 
-HEARTBEAT_TIMEOUT = 600  # seconds
+HEARTBEAT_TIMEOUT = 600
 
-# Local imports
 from init_db import connect, init_db
 from publication_expiry import publication_expiry_sweep_loop
 from scoring_hashprice import blocking_fetch_initial_hashprice
@@ -28,7 +27,6 @@ from logging_utils import setup_logging, uvicorn_log_config
 
 
 def _extrinsic_succeeded(resp: Any) -> bool:
-    """Bittensor SDK v10+ returns ExtrinsicResponse; older code used bool or (bool, str)."""
     if resp is None:
         return False
     if isinstance(resp, bool):
@@ -42,7 +40,6 @@ def _extrinsic_succeeded(resp: Any) -> bool:
 
 
 def _chain_hotkey_at_uid(metagraph: Any, uid: int) -> str:
-    """SS58 hotkey registered at ``uid`` on the synced metagraph (empty if out of range)."""
     n = int(getattr(metagraph, "n", 0) or 0)
     if uid < 0 or uid >= n:
         return ""
@@ -56,7 +53,6 @@ def _chain_hotkey_at_uid(metagraph: Any, uid: int) -> str:
 
 
 def _hotkey_matches_uid(metagraph: Any, uid: int, expected_hotkey: str | None) -> bool:
-    """True if ``expected_hotkey`` is set and equals the chain hotkey at ``uid`` (UID recycling safe)."""
     if expected_hotkey is None:
         return False
     exp = str(expected_hotkey).strip()
@@ -73,10 +69,6 @@ def _pick_winner_uid_from_completed_for_model(
     tasks_creator_version: str,
     tasks_schema_version: str,
 ) -> tuple[Optional[int], Optional[str]]:
-    """
-    Best completed publication whose miner_uid still maps to the stored miner_hotkey on-chain.
-    Skips legacy rows without miner_hotkey or UID/hotkey mismatch (deregistration / recycled UID).
-    """
     rows = conn.execute(
         """
         SELECT miner_uid, miner_hotkey
@@ -166,14 +158,6 @@ def emit_incentive_weights(
     block_time: float,
     period_blocks: Optional[int],
 ) -> Any:
-    """
-    Push model-split weights via Subtensor.set_weights.
-
-    The SDK picks commit-timelocked vs direct mechanism weights from commit_reveal_enabled(netuid).
-    Shape matches subnet-template style: wallet, netuid, uids, weights, wait_for_inclusion, optional period.
-
-    Reference: https://github.com/opentensor/subnet-template/blob/main/validator.py
-    """
     uids_sorted = sorted(int(uid) for uid in winner_weights.keys())
     weights_sorted = [float(winner_weights[uid]) for uid in uids_sorted]
     kwargs: dict[str, Any] = {
@@ -199,7 +183,6 @@ def heartbeat_monitor(last_heartbeat, stop_event):
             logging.shutdown(); os.execv(sys.executable, [sys.executable] + sys.argv)
 
 def main(argv: Optional[list[str]] = None):
-    """Run the Chi subnet validator."""
     bootstrap = argparse.ArgumentParser(add_help=False)
     bootstrap.add_argument("--config", default="configs/validator_config.toml")
     boot_args, _ = bootstrap.parse_known_args(argv)
@@ -224,7 +207,6 @@ def main(argv: Optional[list[str]] = None):
     api_port = int(args.api_port)
     validator_api_url = args.validator_api_url or None
 
-    # Push config into env for shared modules that read runtime flags.
     env_pairs = {
         "DATABASE_URL": str(cfg_get(cfg, "validator.database_url", "")).strip(),
         "VALIDATOR_SIM_WORKERS": str(cfg_get(cfg, "validator.sim_workers", 4)),
@@ -251,7 +233,6 @@ def main(argv: Optional[list[str]] = None):
     setup_logging(app_name="validator", level=log_level)
     logger.info(f"Starting validator on network={network}, netuid={netuid}")
 
-    # Heartbeat setup
     last_heartbeat = [time.time()]
     stop_event = threading.Event()
     heartbeat_thread = threading.Thread(target=heartbeat_monitor, args=(last_heartbeat, stop_event), daemon=True)
@@ -346,7 +327,6 @@ def main(argv: Optional[list[str]] = None):
         threading.Thread(target=server.run, daemon=True).start()
         logger.info("Validator API listening on 0.0.0.0:%s (e.g. http://127.0.0.1:%s)", listen_port, listen_port)
 
-        # Hotkey-signed extrinsics cannot use MEV Shield (SDK warns + tx fails). Default off.
         mev_on = _env_bool("VALIDATOR_MEV_PROTECTION", default=False)
         if mev_on:
             logger.warning(
@@ -362,8 +342,6 @@ def main(argv: Optional[list[str]] = None):
         else:
             tx_period_i = None
 
-        # Commit-reveal only: SDK maps delay → Drand round using this (default 12s = mainnet).
-        # Local turbo chains often have sub-second blocks; if this stays 12.0, the target Drand round is wrong vs chain semantics.
         _wbt_raw = os.getenv("VALIDATOR_WEIGHT_BLOCK_TIME_SEC", "").strip()
         if _wbt_raw:
             try:
@@ -513,7 +491,6 @@ def main(argv: Optional[list[str]] = None):
                         fail_cooldown_sec,
                     )
 
-                # Sleep for ~1 block
                 time.sleep(12)
 
             except KeyboardInterrupt:

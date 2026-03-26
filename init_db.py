@@ -1,14 +1,3 @@
-"""
-Initialize the validator PostgreSQL database schema.
-
-Usage:
-  Set DATABASE_URL in .env or in the environment, then:
-  python init_db.py
-  python init_db.py --reset
-
-Requires DATABASE_URL (PostgreSQL URL). SQLite is not supported.
-"""
-
 from __future__ import annotations
 
 import argparse
@@ -33,7 +22,6 @@ def _get_database_url() -> str:
 
 
 def default_db_path() -> str:
-    """Return the database URL from DATABASE_URL (required)."""
     return _get_database_url()
 
 
@@ -42,7 +30,6 @@ def _is_postgres_url(target: str) -> bool:
 
 
 def _qmark_to_postgres_placeholders(query: str) -> str:
-    """Convert '?' placeholders to '%s' for psycopg."""
     return query.replace("?", "%s")
 
 
@@ -86,31 +73,22 @@ class DBConnection:
 
 
 def connect(db_url: str | None = None) -> DBConnection:
-    """
-    Create a PostgreSQL connection. Uses DATABASE_URL if db_url is None.
-    Returns a wrapper that converts '?' placeholders to '%s' and supports dict-like rows.
-    """
     url = (db_url or os.getenv("DATABASE_URL", "")).strip()
     if not url or not _is_postgres_url(url):
         raise RuntimeError(
             "A PostgreSQL URL is required (postgresql://...). "
             "Set DATABASE_URL or pass --db postgresql://..."
         )
-    import psycopg  # type: ignore
-    from psycopg.rows import dict_row  # type: ignore
+    import psycopg
+    from psycopg.rows import dict_row
 
     raw = psycopg.connect(url, row_factory=dict_row)
     return DBConnection(raw=raw)
 
 
 def init_db(db_url: str | None = None) -> None:
-    """
-    Initialize PostgreSQL schema for devices/tasks/assignments.
-    Safe to call multiple times.
-    """
     url = db_url or _get_database_url()
     with connect(url) as conn:
-        # meta
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS meta (
@@ -120,7 +98,6 @@ def init_db(db_url: str | None = None) -> None:
             """
         )
 
-        # devices
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS devices (
@@ -169,7 +146,6 @@ def init_db(db_url: str | None = None) -> None:
             """
         )
 
-        # tasks
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS tasks (
@@ -196,7 +172,6 @@ def init_db(db_url: str | None = None) -> None:
             """
         )
 
-        # publications (one "publication" = miner-model result across exactly N tasks)
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS publications (
@@ -243,7 +218,6 @@ def init_db(db_url: str | None = None) -> None:
             """
         )
 
-        # assignments (one row per task inside a publication)
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS assignments (
@@ -284,7 +258,6 @@ def init_db(db_url: str | None = None) -> None:
             """
         )
 
-        # Migrations: add columns if missing
         def _ensure_column(table: str, column: str, decl: str) -> None:
             exists = conn.execute(
                 """
@@ -295,7 +268,6 @@ def init_db(db_url: str | None = None) -> None:
                 (table, column),
             ).fetchone()
             if not exists:
-                # PostgreSQL ADD COLUMN syntax
                 conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
 
         _ensure_column("devices", "creator_version", "TEXT NOT NULL DEFAULT '0'")
@@ -310,7 +282,6 @@ def init_db(db_url: str | None = None) -> None:
         _ensure_column("publications", "weight", "INTEGER NOT NULL DEFAULT 0")
         _ensure_column("assignments", "dollar_value", "double precision NULL")
 
-        # Backfill deadline for existing publications (created_at + 10 minutes)
         conn.execute(
             """
             UPDATE publications
@@ -322,7 +293,6 @@ def init_db(db_url: str | None = None) -> None:
             """
         )
 
-        # Persist schema version
         conn.execute(
             """
             INSERT INTO meta(key, value)
@@ -334,10 +304,6 @@ def init_db(db_url: str | None = None) -> None:
 
 
 def reset_db(db_url: str | None = None) -> None:
-    """
-    Drop all managed tables and leave DB empty.
-    Call init_db() after to recreate schema.
-    """
     url = db_url or _get_database_url()
     if not _is_postgres_url(url):
         raise RuntimeError("reset_db requires a PostgreSQL URL (DATABASE_URL or --db).")
@@ -377,7 +343,6 @@ def main() -> None:
         reset_db(db_url)
     init_db(db_url)
 
-    # Mask password in display
     display = db_url.split("@")[-1] if "@" in db_url else db_url
     print(f"[OK] Initialized DB at {display}")
 

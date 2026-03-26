@@ -1,19 +1,3 @@
-"""
-TensorClock miner template (model plug-in + validator discovery via Bittensor).
-
-Contract alignment:
-  - validator API: see `validator_api.py` (`POST /task`, `POST /task/submit`, `GET /health`)
-  - `POST /task` includes `publication_deadline_at` (wall-clock); **410 Gone** if that publication is past deadline
-  - Epistula signing on POST bodies (see `epistula.py`); validators default to ``EPISTULA_REQUIRED=true``
-    (set ``EPISTULA_REQUIRED=false`` only for local dev). Pass a ``Wallet`` to ``ValidatorClient`` so
-    ``/task`` and ``/task/submit`` are signed with sorted JSON bytes matching the server hash.
-  - endpoint discovery: per-UID ``subtensor.get_commitment``; see ``_get_commitment_quiet`` (SDK otherwise logs
-    ERROR on UIDs with empty/broken commitment metadata — not a TensorClock bug), then **every** live validator
-  - optional stake filter: `min_validator_stake` vs `metagraph.S[uid]` (default 0)
-
-This file intentionally has NO DB dependency: miner only talks to validators over HTTP.
-"""
-
 from __future__ import annotations
 
 import abc
@@ -52,11 +36,9 @@ class TaskInfo:
 
 @dataclass(frozen=True)
 class OptimizationParams:
-    """Parameters sent to ``POST /task/submit`` (names match validator)."""
-
-    frequency: float  # MHz
-    voltage: float  # V
-    fan_speed: float  # 0..100 %
+    frequency: float
+    voltage: float
+    fan_speed: float
 
 
 @dataclass
@@ -81,8 +63,6 @@ class TaskSubmitFeedback:
 
 
 class MinerModelError(RuntimeError):
-    """Raised when local validation fails before submitting to the validator."""
-
     def __init__(self, errors: Sequence[str]):
         self.errors = list(errors)
         super().__init__("; ".join(self.errors))
@@ -94,10 +74,6 @@ class MinerModelError(RuntimeError):
 
 
 def validate_optimization_params(params: OptimizationParams) -> List[str]:
-    """
-    Return a list of human-readable errors (empty if OK).
-    This catches bad outputs before submit; final validity is decided by validator simulation.
-    """
     errs: List[str] = []
     if not isinstance(params.frequency, (int, float)):
         errs.append("frequency must be numeric")
@@ -149,12 +125,6 @@ class UnimplementedMinerModel(MinerModel):
 
 
 class ValidatorClient:
-    """
-    Thin ``requests`` wrapper for the validator API.
-
-    Environment variables are *not* read here — pass ``base_url`` explicitly.
-    """
-
     def __init__(
         self,
         base_url: str,
@@ -169,7 +139,6 @@ class ValidatorClient:
 
     @staticmethod
     def _json_body_bytes(obj: dict[str, Any]) -> bytes:
-        # Must match bytes hashed by Epistula on the server.
         return json.dumps(obj, sort_keys=True, separators=(",", ":")).encode("utf-8")
 
     def _post_signed_json(self, path: str, body: dict[str, Any]) -> requests.Response:
@@ -255,16 +224,6 @@ def _normalize_endpoint(raw: str) -> Optional[str]:
 
 @contextmanager
 def _suppress_root_logging_temporarily(level: int = logging.CRITICAL) -> Iterator[None]:
-    """
-    Bittensor ``Subtensor.get_commitment`` logs ``logging.error(exception)`` when ``decode_metadata`` fails
-    (e.g. uid with no commitment → metadata shape None → ``decode_metadata`` does ``metadata['info'][...]``
-    and raises ``TypeError: 'NoneType' object is not subscriptable``). That is expected for empty UIDs; the SDK
-    still returns \"\" but pollutes our miner logs. Briefly raise the *root* logger level so those ERROR lines
-    are not emitted during discovery (single-threaded miner startup only).
-
-    Some SDK builds attach handlers on the ``bittensor`` logger with their own level, so root-only suppression
-    is not enough — also raise common bittensor sub-loggers for the discovery window.
-    """
     root = logging.getLogger()
     prev: list[tuple[logging.Logger, int]] = [(root, root.level)]
     root.setLevel(level)
@@ -280,13 +239,11 @@ def _suppress_root_logging_temporarily(level: int = logging.CRITICAL) -> Iterato
 
 
 def _get_commitment_quiet(subtensor: Any, netuid: int, uid: int) -> str:
-    """``subtensor.get_commitment`` without SDK ERROR spam on decode failure (see _suppress_root_logging_temporarily)."""
     with _suppress_root_logging_temporarily():
         return subtensor.get_commitment(netuid, uid)
 
 
 def _neuron_stake(metagraph: Any, uid: int) -> float:
-    """Stake S[uid] as float (subnet alpha units; depends on SDK version)."""
     s_arr = getattr(metagraph, "S", None)
     if s_arr is None:
         return 0.0
@@ -310,33 +267,12 @@ def discover_validator_endpoints(
     blacklist_force_validator_permit: bool = True,
     timeout_s: float = 10.0,
 ) -> list[str]:
-    """
-    Discover **all** live validator HTTP endpoints from chain commitments.
-
-    Mirrors the blacklist logic from ``mode-network/synth-subnet`` ``neurons/miner.py``
-    (outbound discovery is the dual of inbound ``blacklist()``):
-
-    - ``blacklist_validator_min_stake``: skip UIDs with ``S[uid] <=`` this value (same as synth-subnet).
-      Default ``-1`` disables this filter so **zero-stake** local dev validators are not skipped.
-      Use ``0`` on mainnet to ignore zero-stake neurons.
-    - ``blacklist_force_validator_permit``: if True, only UIDs with ``validator_permit`` (like synth).
-
-    No priority: UIDs are processed in ascending order; every matching UID with a
-    commitment and healthy ``/health`` is included.
-    """
     subtensor = bt.Subtensor(network=network)
     metagraph = bt.Metagraph(netuid=netuid, network=network)
     with _suppress_root_logging_temporarily():
         metagraph.sync(subtensor=subtensor)
 
     def _commitment_for_uid(uid: int) -> Optional[str]:
-        """
-        Read commitment per-UID (same chain query as ``scripts/set_validator_commitment.py``).
-
-        Uses ``_get_commitment_quiet`` because upstream ``bittensor`` ``get_commitment`` does
-        ``logging.error(error)`` on *any* ``decode_metadata`` failure (bittensor/core/subtensor.py ~1590),
-        which for empty UIDs often prints only ``'NoneType' object is not subscriptable`` — misleading noise.
-        """
         try:
             raw = _get_commitment_quiet(subtensor, netuid, uid)
         except Exception:
@@ -363,7 +299,6 @@ def discover_validator_endpoints(
     for uid in range(n):
         if blacklist_force_validator_permit:
             if vperm is None:
-                # Some SDKs leave this unset; do not block discovery.
                 pass
             else:
                 try:
@@ -373,7 +308,6 @@ def discover_validator_endpoints(
                 except (IndexError, TypeError, KeyError):
                     continue
         stake = _neuron_stake(metagraph, uid)
-        # Same rule as synth-subnet: blacklist when stake <= threshold
         if stake <= thr:
             skip_stake += 1
             continue
@@ -414,7 +348,6 @@ def discover_validator_endpoints(
 
 
 def task_from_claim_task_dict(task_obj: dict[str, Any]) -> TaskInfo:
-    """Build ``TaskInfo`` from the nested ``task`` object in ``POST /task`` JSON."""
     return TaskInfo(
         task_id=task_obj["task_id"],
         device_id=task_obj["device_id"],

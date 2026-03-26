@@ -1,16 +1,3 @@
-"""
-Epistula HTTP signing (Bittensor subnet standard).
-
-Message format (see knowledge/sdk.quick_reference.yaml):
-  message = f"{nonce}.{sha256_hex(body)}"
-  signature = hotkey.sign(message.encode())  # hex-encoded in headers
-
-Headers:
-  X-Epistula-Timestamp  — nonce (nanoseconds string)
-  X-Epistula-Signature  — hex signature
-  X-Epistula-Hotkey     — SS58 hotkey address
-"""
-
 from __future__ import annotations
 
 import hashlib
@@ -30,7 +17,6 @@ def build_epistula_message(*, nonce: str, body: bytes) -> str:
 
 
 def sign_epistula_request_body(wallet: "Wallet", body: bytes) -> dict[str, str]:
-    """Return headers to attach to an HTTP request carrying ``body`` bytes."""
     nonce = str(int(time.time() * 1_000_000_000))
     message = build_epistula_message(nonce=nonce, body=body)
     signature = wallet.hotkey.sign(message.encode()).hex()
@@ -42,7 +28,6 @@ def sign_epistula_request_body(wallet: "Wallet", body: bytes) -> dict[str, str]:
 
 
 def _header_get(headers: Any, primary: str) -> Optional[str]:
-    """Works with Starlette ``Headers`` (case-insensitive) and plain dicts."""
     if headers is None:
         return None
     if hasattr(headers, "get"):
@@ -54,11 +39,6 @@ def _header_get(headers: Any, primary: str) -> Optional[str]:
 
 
 def verify_epistula_request(*, headers: Any, body: bytes, max_age_s: float = 120.0) -> str:
-    """
-    Verify Epistula headers against raw body. Returns verified hotkey SS58.
-
-    Raises ValueError on failure.
-    """
     from bittensor_wallet import Keypair
 
     ts = _header_get(headers, "X-Epistula-Timestamp")

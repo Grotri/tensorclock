@@ -1,13 +1,3 @@
-"""
-Hashprice cache + ranking values for assignments/publications.
-
-- Cached USD/TH/day in ``hashprice_cache`` (singleton row ``id=1``), refreshed at most every
-  ``HASHPRICE_TTL_SEC`` (default 5h) via background job; startup blocks until first fetch succeeds.
-- ``net_profit`` / ``avg_net_profit`` are already stored as USD/day (net revenue), so
-  ``dollar_value`` mirrors those values directly.
-- ``weight`` on publications: 1 for the current best completed publication (by dollar_value), 0 else.
-"""
-
 from __future__ import annotations
 
 import logging
@@ -41,7 +31,6 @@ def _parse_iso_utc(s: str) -> datetime:
 
 
 def is_hashprice_stale(updated_at_iso: str) -> bool:
-    """True if cache row is older than HASHPRICE_TTL_SEC or unparsable."""
     try:
         dt = _parse_iso_utc(updated_at_iso)
         age = (datetime.now(timezone.utc) - dt).total_seconds()
@@ -60,7 +49,6 @@ def get_cached_usd_per_th_day(conn: Any) -> Optional[float]:
 
 
 def upsert_hashprice_cache(conn: Any, *, q: Any) -> None:
-    """Persist quote from :func:`hashprice_mempool.fetch_hashprice_quote`."""
     now = datetime.now(timezone.utc).isoformat()
     conn.execute(
         """
@@ -77,11 +65,6 @@ def upsert_hashprice_cache(conn: Any, *, q: Any) -> None:
 
 
 def bulk_recompute_dollar_values_and_leader(conn: Any, usd_per_th_day: float) -> None:
-    """
-    Recompute ``dollar_value`` for all terminal assignments and completed publications,
-    then set ``weight`` (0/1) for the leading completed publication (version-scoped).
-    Single transaction; uses batched UPDATEs (no per-row Python loop).
-    """
     conn.execute(
         """
         UPDATE assignments
@@ -107,7 +90,6 @@ def bulk_recompute_dollar_values_and_leader(conn: Any, usd_per_th_day: float) ->
 
 
 def recompute_leader_weights(conn: Any) -> None:
-    """Set weight=1 for best completed publication (matching task versions), 0 for others."""
     conn.execute(
         """
         UPDATE publications
@@ -151,7 +133,6 @@ def apply_scores_after_assignment_update(
     task_id: str,
     net_profit: Optional[float],
 ) -> None:
-    """Update dollar_value for one assignment row using current hashprice cache."""
     usd = get_cached_usd_per_th_day(conn)
     if usd is None:
         return
@@ -167,7 +148,6 @@ def apply_scores_after_assignment_update(
 
 
 def apply_scores_after_publication_completed(conn: Any, *, publication_id: str) -> None:
-    """Set publication.dollar_value from avg_net_profit and refresh leader weights."""
     usd = get_cached_usd_per_th_day(conn)
     if usd is None:
         return
@@ -183,10 +163,6 @@ def apply_scores_after_publication_completed(conn: Any, *, publication_id: str) 
 
 
 def blocking_fetch_initial_hashprice(db_url: str) -> None:
-    """
-    Required before serving miners: fetch hashprice with retries until success, then populate cache
-    and run a full recompute.
-    """
     delay = 5.0
     max_delay = 120.0
     while True:
@@ -230,10 +206,6 @@ def _refresh_worker(db_url: str) -> None:
 
 
 def schedule_hashprice_refresh_if_stale(db_url: str) -> None:
-    """
-    If cache is older than HASHPRICE_TTL_SEC, start a background refresh (non-blocking).
-    Safe to call on every miner request; at most one refresh thread at a time.
-    """
     global _refresh_thread
     with _refresh_lock:
         if _refresh_thread is not None and _refresh_thread.is_alive():
