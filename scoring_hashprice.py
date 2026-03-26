@@ -1,0 +1,277 @@
+"""
+Hashprice cache + ranking values for assignments/publications.
+
+- Cached USD/TH/day in ``hashprice_cache`` (singleton row ``id=1``), refreshed at most every
+  ``HASHPRICE_TTL_SEC`` (default 5h) via background job; startup blocks until first fetch succeeds.
+- ``net_profit`` / ``avg_net_profit`` are already stored as USD/day (net revenue), so
+  ``dollar_value`` mirrors those values directly.
+- ``weight`` on publications: 1 for the current best completed publication (by dollar_value), 0 else.
+"""
+
+from __future__ import annotations
+
+import logging
+import os
+import threading
+import time
+from datetime import datetime, timezone
+from typing import Any, Optional
+
+from init_db import connect
+from hashprice_mempool import fetch_hashprice_quote
+from task_manager import EXPECTED_TASKS_PER_PUBLICATION
+from version import DB_SCHEMA_VERSION, TASK_CREATOR_VERSION
+
+logger = logging.getLogger(__name__)
+
+# Refresh hashprice from mempool at most every this many seconds.
+HASHPRICE_TTL_SEC = int(os.getenv("HASHPRICE_TTL_SEC", str(5 * 3600)).strip() or str(5 * 3600))
+
+_refresh_lock = threading.Lock()
+_refresh_thread: Optional[threading.Thread] = None
+
+
+def _parse_iso_utc(s: str) -> datetime:
+    raw = str(s).replace("Z", "+00:00")
+    dt = datetime.fromisoformat(raw)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def is_hashprice_stale(updated_at_iso: str) -> bool:
+    """True if cache row is older than HASHPRICE_TTL_SEC or unparsable."""
+    try:
+        dt = _parse_iso_utc(updated_at_iso)
+        age = (datetime.now(timezone.utc) - dt).total_seconds()
+        return age >= float(HASHPRICE_TTL_SEC)
+    except Exception:
+        return True
+
+
+def get_cached_usd_per_th_day(conn: Any) -> Optional[float]:
+    row = conn.execute(
+        "SELECT usd_per_th_per_day FROM hashprice_cache WHERE id=1",
+    ).fetchone()
+    if row is None or row.get("usd_per_th_per_day") is None:
+        return None
+    return float(row["usd_per_th_per_day"])
+
+
+def upsert_hashprice_cache(conn: Any, *, q: Any) -> None:
+    """Persist quote from :func:`hashprice_mempool.fetch_hashprice_quote`."""
+    now = datetime.now(timezone.utc).isoformat()
+    conn.execute(
+        """
+        INSERT INTO hashprice_cache (id, usd_per_th_per_day, btc_per_th_per_day, btc_usd, updated_at)
+        VALUES (1, ?, ?, ?, ?)
+        ON CONFLICT (id) DO UPDATE SET
+            usd_per_th_per_day = EXCLUDED.usd_per_th_per_day,
+            btc_per_th_per_day = EXCLUDED.btc_per_th_per_day,
+            btc_usd = EXCLUDED.btc_usd,
+            updated_at = EXCLUDED.updated_at
+        """,
+        (float(q.usd_per_th_per_day), float(q.btc_per_th_per_day), float(q.btc_usd), now),
+    )
+
+
+def bulk_recompute_dollar_values_and_leader(conn: Any, usd_per_th_day: float) -> None:
+    """
+    Recompute ``dollar_value`` for all terminal assignments and completed publications,
+    then set ``weight`` (0/1) for the leading completed publication (version-scoped).
+    Single transaction; uses batched UPDATEs (no per-row Python loop).
+    """
+    conn.execute(
+        """
+        UPDATE assignments
+        SET dollar_value = COALESCE(net_profit, 0)
+        WHERE state IN ('completed', 'failed')
+        """
+    )
+    conn.execute(
+        """
+        UPDATE publications
+        SET dollar_value = COALESCE(avg_net_profit, 0)
+        WHERE state = 'completed' AND avg_net_profit IS NOT NULL
+        """
+    )
+    conn.execute(
+        """
+        UPDATE publications
+        SET dollar_value = 0.0, weight = 0
+        WHERE state = 'expired' OR state = 'cancelled'
+        """,
+    )
+    recompute_leader_weights(conn)
+
+
+def recompute_leader_weights(conn: Any) -> None:
+    """Set weight=1 for best completed publication (matching task versions), 0 for others."""
+    conn.execute(
+        """
+        UPDATE publications
+        SET weight = 0
+        WHERE state = 'completed'
+          AND tasks_creator_version = ?
+          AND tasks_schema_version = ?
+        """,
+        (TASK_CREATOR_VERSION, DB_SCHEMA_VERSION),
+    )
+    conn.execute(
+        """
+        UPDATE publications p
+        SET weight = 1
+        WHERE p.state = 'completed'
+          AND p.tasks_creator_version = ?
+          AND p.tasks_schema_version = ?
+          AND p.publication_id = (
+              SELECT publication_id
+              FROM publications
+              WHERE state = 'completed'
+                AND tasks_creator_version = ?
+                AND tasks_schema_version = ?
+              ORDER BY dollar_value DESC NULLS LAST, avg_net_profit DESC NULLS LAST, completed_at ASC
+              LIMIT 1
+          )
+        """,
+        (
+            TASK_CREATOR_VERSION,
+            DB_SCHEMA_VERSION,
+            TASK_CREATOR_VERSION,
+            DB_SCHEMA_VERSION,
+        ),
+    )
+
+
+def apply_scores_after_assignment_update(
+    conn: Any,
+    *,
+    publication_id: str,
+    task_id: str,
+    net_profit: Optional[float],
+) -> None:
+    """Update dollar_value for one assignment row using current hashprice cache."""
+    usd = get_cached_usd_per_th_day(conn)
+    if usd is None:
+        return
+    nv = float(net_profit) if net_profit is not None else 0.0
+    conn.execute(
+        """
+        UPDATE assignments
+        SET dollar_value = ?
+        WHERE publication_id = ? AND task_id = ?
+        """,
+        (nv, publication_id, task_id),
+    )
+
+
+def apply_scores_after_publication_completed(conn: Any, *, publication_id: str) -> None:
+    """Set publication.dollar_value from avg_net_profit and refresh leader weights."""
+    usd = get_cached_usd_per_th_day(conn)
+    if usd is None:
+        return
+    conn.execute(
+        """
+        UPDATE publications
+        SET dollar_value = COALESCE(avg_net_profit, 0)
+        WHERE publication_id = ? AND state = 'completed'
+        """,
+        (publication_id,),
+    )
+    recompute_leader_weights(conn)
+
+
+def blocking_fetch_initial_hashprice(db_url: str) -> None:
+    """
+    Required before serving miners: fetch hashprice with retries until success, then populate cache
+    and run a full recompute.
+    """
+    delay = 5.0
+    max_delay = 120.0
+    while True:
+        try:
+            q = fetch_hashprice_quote(timeout_s=45.0)
+            with connect(db_url) as conn:
+                upsert_hashprice_cache(conn, q=q)
+                bulk_recompute_dollar_values_and_leader(conn, float(q.usd_per_th_per_day))
+            logger.info(
+                "hashprice: initial cache OK usd_per_th_day=%.6f btc_usd=%.2f",
+                q.usd_per_th_per_day,
+                q.btc_usd,
+            )
+            return
+        except Exception as e:
+            logger.warning(
+                "hashprice: initial fetch failed (%s); retry in %.0fs",
+                e,
+                delay,
+            )
+            time.sleep(delay)
+            delay = min(max_delay, delay * 1.5)
+
+
+def _refresh_worker(db_url: str) -> None:
+    try:
+        q = fetch_hashprice_quote(timeout_s=45.0)
+    except Exception as e:
+        logger.warning("hashprice: background refresh failed (%s); keeping previous cache", e)
+        return
+    try:
+        with connect(db_url) as conn:
+            upsert_hashprice_cache(conn, q=q)
+            bulk_recompute_dollar_values_and_leader(conn, float(q.usd_per_th_per_day))
+        logger.info(
+            "hashprice: refreshed usd_per_th_day=%.6f",
+            q.usd_per_th_per_day,
+        )
+    except Exception:
+        logger.exception("hashprice: DB update after refresh failed")
+
+
+def schedule_hashprice_refresh_if_stale(db_url: str) -> None:
+    """
+    If cache is older than HASHPRICE_TTL_SEC, start a background refresh (non-blocking).
+    Safe to call on every miner request; at most one refresh thread at a time.
+    """
+    global _refresh_thread
+    with _refresh_lock:
+        if _refresh_thread is not None and _refresh_thread.is_alive():
+            return
+        try:
+            with connect(db_url) as conn:
+                row = conn.execute(
+                    "SELECT updated_at FROM hashprice_cache WHERE id=1",
+                ).fetchone()
+            if row is None:
+                stale = True
+            else:
+                stale = is_hashprice_stale(str(row["updated_at"]))
+            if not stale:
+                return
+        except Exception:
+            return
+
+        def run() -> None:
+            try:
+                _refresh_worker(db_url)
+            finally:
+                global _refresh_thread
+                with _refresh_lock:
+                    _refresh_thread = None
+
+        _refresh_thread = threading.Thread(target=run, daemon=True, name="hashprice-refresh")
+        _refresh_thread.start()
+
+
+__all__ = [
+    "HASHPRICE_TTL_SEC",
+    "apply_scores_after_assignment_update",
+    "apply_scores_after_publication_completed",
+    "blocking_fetch_initial_hashprice",
+    "bulk_recompute_dollar_values_and_leader",
+    "get_cached_usd_per_th_day",
+    "is_hashprice_stale",
+    "recompute_leader_weights",
+    "schedule_hashprice_refresh_if_stale",
+    "upsert_hashprice_cache",
+]

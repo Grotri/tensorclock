@@ -66,6 +66,19 @@ class PublicationRunResult:
     publication_completed: bool
 
 
+@dataclass(frozen=True)
+class TaskSubmitFeedback:
+    state: str
+    queries_used: int
+    remaining_queries: int
+    can_continue: bool
+    net_profit_usd_day: Optional[float]
+    gross_revenue_usd_day: Optional[float]
+    electricity_cost_usd_day: Optional[float]
+    overheated: bool
+    warning: Optional[str]
+
+
 class MinerModelError(RuntimeError):
     """Raised when local validation fails before submitting to the validator."""
 
@@ -113,6 +126,10 @@ class MinerModel(abc.ABC):
     @abc.abstractmethod
     def predict(self, task: TaskInfo) -> OptimizationParams:
         raise NotImplementedError
+
+    def should_continue(self, task: TaskInfo, feedback: TaskSubmitFeedback) -> bool:
+        """Return True to continue optimizing the same task, else finalize task."""
+        return False
 
 
 class UnimplementedMinerModel(MinerModel):
@@ -210,6 +227,16 @@ class ValidatorClient:
             },
         )
 
+    def decide_task(self, *, publication_id: str, task_id: str, action: str) -> requests.Response:
+        return self._post_signed_json(
+            "/task/decision",
+            {
+                "publication_id": publication_id,
+                "task_id": task_id,
+                "action": action,
+            },
+        )
+
 
 # ---------------------------------------------------------------------------
 # Bittensor validator discovery
@@ -278,9 +305,9 @@ def discover_validator_endpoints(
     *,
     network: str,
     netuid: int,
-    blacklist_validator_min_stake: float = 0.0,
+    blacklist_validator_min_stake: float = -1.0,
     blacklist_force_validator_permit: bool = True,
-    timeout_s: float = 6.0,
+    timeout_s: float = 10.0,
 ) -> list[str]:
     """
     Discover **all** live validator HTTP endpoints from chain commitments.
@@ -288,8 +315,9 @@ def discover_validator_endpoints(
     Mirrors the blacklist logic from ``mode-network/synth-subnet`` ``neurons/miner.py``
     (outbound discovery is the dual of inbound ``blacklist()``):
 
-    - ``blacklist_validator_min_stake``: skip UIDs with ``S[uid] <=`` this value
-      (same comparison as ``stake <= validator_min_stake`` there; default ``0`` keeps all positive stake).
+    - ``blacklist_validator_min_stake``: skip UIDs with ``S[uid] <=`` this value (same as synth-subnet).
+      Default ``-1`` disables this filter so **zero-stake** local dev validators are not skipped.
+      Use ``0`` on mainnet to ignore zero-stake neurons.
     - ``blacklist_force_validator_permit``: if True, only UIDs with ``validator_permit`` (like synth).
 
     No priority: UIDs are processed in ascending order; every matching UID with a
@@ -326,6 +354,11 @@ def discover_validator_endpoints(
     out: list[str] = []
     n = int(metagraph.n)
     vperm = getattr(metagraph, "validator_permit", None)
+    skip_permit = 0
+    skip_stake = 0
+    skip_no_commit = 0
+    skip_health = 0
+    thr = float(blacklist_validator_min_stake)
     for uid in range(n):
         if blacklist_force_validator_permit:
             if vperm is None:
@@ -334,24 +367,41 @@ def discover_validator_endpoints(
             else:
                 try:
                     if not bool(vperm[uid]):
+                        skip_permit += 1
                         continue
                 except (IndexError, TypeError, KeyError):
                     continue
         stake = _neuron_stake(metagraph, uid)
         # Same rule as synth-subnet: blacklist when stake <= threshold
-        if stake <= float(blacklist_validator_min_stake):
+        if stake <= thr:
+            skip_stake += 1
             continue
         endpoint = _commitment_for_uid(uid)
         if not endpoint:
+            skip_no_commit += 1
             continue
         try:
             ok = requests.get(f"{endpoint}/health", timeout=timeout_s).status_code == 200
             if ok:
                 logger.info("Validator endpoint uid=%s stake=%s url=%s", uid, stake, endpoint)
                 out.append(endpoint)
+            else:
+                skip_health += 1
         except Exception:
+            skip_health += 1
             continue
     if not out:
+        logger.error(
+            "Validator discovery: no live endpoints (netuid=%s n=%s). Skipped: permit=%s stake=%s "
+            "no_commitment=%s health_fail=%s. Try --validator-url, --min-validator-stake -1, "
+            "or --blacklist.force_validator_permit false on local chains.",
+            netuid,
+            n,
+            skip_permit,
+            skip_stake,
+            skip_no_commit,
+            skip_health,
+        )
         raise RuntimeError(
             "No live validator endpoints discovered (check commitments, min validator stake, and /health)."
         )
@@ -432,28 +482,82 @@ class MinerRunner:
             task = self._task_from_claim(data["task"])
             tasks_attempted += 1
 
-            params = model.predict(task)
-            errs = validate_optimization_params(params)
-            if errs:
-                raise MinerModelError(errs)
+            while True:
+                params = model.predict(task)
+                errs = validate_optimization_params(params)
+                if errs:
+                    raise MinerModelError(errs)
 
-            sr = self.client.submit(publication_id=publication_id, task_id=task.task_id, params=params)
-            if sr.status_code == 410:
-                logger.warning("Publication deadline expired (410 on submit); stopping run.")
+                sr = self.client.submit(publication_id=publication_id, task_id=task.task_id, params=params)
+                if sr.status_code == 410:
+                    logger.warning("Publication deadline expired (410 on submit); stopping run.")
+                    completed = False
+                    break
+                if sr.status_code >= 400:
+                    logger.error("submit failed: %s %s", sr.status_code, sr.text)
+                sr.raise_for_status()
+                sub = sr.json()
+                last_state = str(sub.get("state"))
+                completed = bool(sub.get("publication_completed"))
+                feedback = TaskSubmitFeedback(
+                    state=last_state,
+                    queries_used=int(sub.get("queries_used", 0)),
+                    remaining_queries=int(sub.get("remaining_queries", 0)),
+                    can_continue=bool(sub.get("can_continue", False)),
+                    net_profit_usd_day=(
+                        float(sub["net_profit_usd_day"]) if sub.get("net_profit_usd_day") is not None else None
+                    ),
+                    gross_revenue_usd_day=(
+                        float(sub["gross_revenue_usd_day"]) if sub.get("gross_revenue_usd_day") is not None else None
+                    ),
+                    electricity_cost_usd_day=(
+                        float(sub["electricity_cost_usd_day"])
+                        if sub.get("electricity_cost_usd_day") is not None
+                        else None
+                    ),
+                    overheated=bool(sub.get("overheated", False)),
+                    warning=sub.get("warning"),
+                )
+                logger.info(
+                    "task=%s state=%s q=%s rem=%s net_usd_day=%s can_continue=%s publication_completed=%s",
+                    task.task_id,
+                    feedback.state,
+                    feedback.queries_used,
+                    feedback.remaining_queries,
+                    feedback.net_profit_usd_day,
+                    feedback.can_continue,
+                    completed,
+                )
+                if completed:
+                    break
+                if not feedback.can_continue:
+                    break
+                if model.should_continue(task, feedback):
+                    continue
+
+                dr = self.client.decide_task(
+                    publication_id=publication_id,
+                    task_id=task.task_id,
+                    action="finalize",
+                )
+                if dr.status_code == 410:
+                    logger.warning("Publication deadline expired (410 on decision); stopping run.")
+                    completed = False
+                    break
+                if dr.status_code >= 400:
+                    logger.error("decision failed: %s %s", dr.status_code, dr.text)
+                dr.raise_for_status()
+                dsub = dr.json()
+                last_state = str(dsub.get("state", last_state))
+                completed = bool(dsub.get("publication_completed", completed))
+                logger.info(
+                    "task=%s finalized_by_miner state=%s publication_completed=%s",
+                    task.task_id,
+                    last_state,
+                    completed,
+                )
                 break
-            if sr.status_code >= 400:
-                logger.error("submit failed: %s %s", sr.status_code, sr.text)
-            sr.raise_for_status()
-            sub = sr.json()
-            last_state = sub.get("state")
-            completed = bool(sub.get("publication_completed"))
-            logger.info(
-                "task=%s state=%s overheated=%s publication_completed=%s",
-                task.task_id,
-                last_state,
-                sub.get("overheated"),
-                completed,
-            )
+
             if completed:
                 break
 

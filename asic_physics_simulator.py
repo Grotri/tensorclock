@@ -16,6 +16,7 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 from enum import Enum
 import warnings
+import hashlib
 from pathlib import Path
 
 # Import from virtual_device_generator
@@ -135,6 +136,8 @@ class ASICPhysicsSimulator:
         # Noise parameters for system instability
         self._noise_magnitude = 0.0001   # 2% voltage noise (std of normal)
         self._noise_frequency = 0.01   # Probability of noise spike
+        # Number of deterministic noise realizations averaged into smoothed F/V curve.
+        self._noise_smoothing_runs = 5
 
         # F/V curve: voltage (Y) scaling coefficients
         # Below nominal frequency: voltage multiplier
@@ -365,7 +368,15 @@ class ASICPhysicsSimulator:
                 is_stable = True
 
             if add_noise:
-                voltage = self.add_voltage_noise(voltage, freq_scalar, point_seed)
+                if seed is None:
+                    # Default: deterministic smoothed-noise curve (stable across runs/nodes).
+                    voltage = self._smoothed_noisy_voltage(
+                        voltage=voltage,
+                        frequency=freq_scalar,
+                    )
+                else:
+                    # Explicit seed keeps old behavior for experiments/tests.
+                    voltage = self.add_voltage_noise(voltage, freq_scalar, point_seed)
 
             voltage = float(np.clip(voltage, limits.min_voltage, limits.max_voltage))
 
@@ -376,6 +387,55 @@ class ASICPhysicsSimulator:
             ))
 
         return curve
+
+    def _deterministic_voltage_noise_seed(self, frequency: float) -> int:
+        """
+        Stable seed for F/V noise so every validator/miner sees the same noisy curve
+        for the same device + frequency.
+        """
+        if not self.device:
+            raise ValueError("No device loaded")
+        key = f"{self.device.device_id}|{self.device.asic_model}|{frequency:.6f}"
+        digest = hashlib.sha256(key.encode("utf-8")).digest()
+        return int.from_bytes(digest[:8], "big") % (2**32)
+
+    def _smoothed_noisy_voltage(self, *, voltage: float, frequency: float, runs: Optional[int] = None) -> float:
+        """
+        Deterministic smoothed-noise voltage at a frequency.
+        Uses mean over a fixed number of seeded noise realizations.
+        """
+        n = int(runs if runs is not None else self._noise_smoothing_runs)
+        if n <= 1:
+            seed = self._deterministic_voltage_noise_seed(frequency)
+            return float(self.add_voltage_noise(voltage, frequency, seed=seed))
+        base_seed = self._deterministic_voltage_noise_seed(frequency)
+        vals: List[float] = []
+        for i in range(n):
+            vals.append(float(self.add_voltage_noise(voltage, frequency, seed=base_seed + i)))
+        return float(np.mean(vals))
+
+    def _required_min_voltage_at_frequency(
+        self,
+        *,
+        frequency: float,
+        hidden: HiddenParameters,
+        limits: HardwareLimits,
+    ) -> float:
+        """
+        Deterministic per-frequency minimum voltage used by `simulate()` validation.
+        It mirrors the generated curve logic: base F/V + undervolting + deterministic noise.
+        """
+        base_voltage = self.calculate_base_voltage(frequency, hidden.silicon_quality)
+        undervolted_voltage, _is_stable = self.apply_undervolting(
+            base_voltage,
+            hidden.silicon_quality,
+            frequency,
+        )
+        noisy_voltage = self._smoothed_noisy_voltage(
+            voltage=undervolted_voltage,
+            frequency=frequency,
+        )
+        return float(np.clip(noisy_voltage, limits.min_voltage, limits.max_voltage))
     
     def plot_frequency_voltage_curve(
         self,
@@ -467,6 +527,25 @@ class ASICPhysicsSimulator:
                 efficiency=float('inf'),
                 valid=False,
                 warning=f"Voltage {params.voltage} V outside limits [{limits.min_voltage}, {limits.max_voltage}]"
+            )
+
+        # Enforce minimum voltage from deterministic noisy F/V curve at this frequency.
+        min_required_voltage = self._required_min_voltage_at_frequency(
+            frequency=float(params.frequency),
+            hidden=hidden,
+            limits=limits,
+        )
+        if float(params.voltage) < float(min_required_voltage):
+            return SimulationOutcome(
+                temperature=ambient_temp,
+                power=0,
+                hashrate=0,
+                efficiency=float('inf'),
+                valid=False,
+                warning=(
+                    f"Voltage {params.voltage:.4f} V is below required minimum "
+                    f"{min_required_voltage:.4f} V at frequency {params.frequency:.2f} MHz"
+                ),
             )
         
         # Calculate temperature

@@ -217,7 +217,9 @@ def init_db(db_url: str | None = None) -> None:
                 avg_net_profit double precision NULL,
                 publication_deadline_at TEXT NULL,
                 total_tasks_expected INTEGER NULL,
-                miner_hotkey TEXT NULL
+                miner_hotkey TEXT NULL,
+                dollar_value double precision NULL,
+                weight INTEGER NOT NULL DEFAULT 0
             );
             """
         )
@@ -226,6 +228,18 @@ def init_db(db_url: str | None = None) -> None:
             """
             CREATE INDEX IF NOT EXISTS idx_publications_miner_active
             ON publications (miner_uid, state);
+            """
+        )
+
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS hashprice_cache (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                usd_per_th_per_day double precision NOT NULL,
+                btc_per_th_per_day double precision NOT NULL,
+                btc_usd double precision NOT NULL,
+                updated_at TEXT NOT NULL
+            );
             """
         )
 
@@ -247,6 +261,7 @@ def init_db(db_url: str | None = None) -> None:
                 net_profit double precision NULL,
                 best_efficiency double precision NULL,
                 completed_at TEXT NULL,
+                dollar_value double precision NULL,
 
                 PRIMARY KEY (publication_id, task_id),
                 FOREIGN KEY(publication_id) REFERENCES publications(publication_id) ON DELETE CASCADE,
@@ -291,6 +306,9 @@ def init_db(db_url: str | None = None) -> None:
         _ensure_column("publications", "publication_deadline_at", "TEXT NULL")
         _ensure_column("publications", "total_tasks_expected", "INTEGER NULL")
         _ensure_column("publications", "miner_hotkey", "TEXT NULL")
+        _ensure_column("publications", "dollar_value", "double precision NULL")
+        _ensure_column("publications", "weight", "INTEGER NOT NULL DEFAULT 0")
+        _ensure_column("assignments", "dollar_value", "double precision NULL")
 
         # Backfill deadline for existing publications (created_at + 10 minutes)
         conn.execute(
@@ -324,6 +342,7 @@ def reset_db(db_url: str | None = None) -> None:
     if not _is_postgres_url(url):
         raise RuntimeError("reset_db requires a PostgreSQL URL (DATABASE_URL or --db).")
     with connect(url) as conn:
+        conn.execute("DROP TABLE IF EXISTS hashprice_cache CASCADE")
         conn.execute("DROP TABLE IF EXISTS publications CASCADE")
         conn.execute("DROP TABLE IF EXISTS assignments CASCADE")
         conn.execute("DROP TABLE IF EXISTS tasks CASCADE")

@@ -43,6 +43,7 @@ from miner_template import (
     MinerModel,
     MinerRunner,
     OptimizationParams,
+    TaskSubmitFeedback,
     TaskInfo,
     ValidatorClient,
     configure_logging,
@@ -84,18 +85,75 @@ def _env_bool(*keys: str, default: bool = True) -> bool:
 
 class NominalS19MinerModel(MinerModel):
     """
-    Deterministic policy with safe values for bundled Antminer S19 spec:
-      - frequency=600 MHz
-      - voltage=13.0 V
-      - fan_speed=100%
+    Multi-step reference strategy for bundled Antminer S19 spec.
+
+    For each task we try a deterministic ladder of operating points and continue
+    while validator returns ``can_continue=true``.
     """
 
+    _CANDIDATES: tuple[OptimizationParams, ...] = (
+        OptimizationParams(frequency=580.0, voltage=12.8, fan_speed=90.0),
+        OptimizationParams(frequency=600.0, voltage=13.0, fan_speed=95.0),
+        OptimizationParams(frequency=620.0, voltage=13.1, fan_speed=100.0),
+        OptimizationParams(frequency=640.0, voltage=13.2, fan_speed=100.0),
+    )
+
+    def __init__(self) -> None:
+        # task_id -> iterative optimization state
+        self._task_state: dict[str, dict[str, object]] = {}
+
+    def _state_for(self, task_id: str) -> dict[str, object]:
+        st = self._task_state.get(task_id)
+        if st is None:
+            st = {
+                "next_idx": 0,
+                "last_params": None,
+                "best_params": None,
+                "best_profit": None,
+                "replay_best_once": False,
+            }
+            self._task_state[task_id] = st
+        return st
+
     def predict(self, task: TaskInfo) -> OptimizationParams:
-        return OptimizationParams(
-            frequency=600.0,
-            voltage=13.0,
-            fan_speed=100.0,
-        )
+        st = self._state_for(task.task_id)
+        if bool(st["replay_best_once"]) and isinstance(st["best_params"], OptimizationParams):
+            params = st["best_params"]
+            st["replay_best_once"] = False
+            st["last_params"] = params
+            return params
+
+        idx = int(st["next_idx"])
+        if idx >= len(self._CANDIDATES):
+            idx = len(self._CANDIDATES) - 1
+        params = self._CANDIDATES[idx]
+        st["next_idx"] = int(st["next_idx"]) + 1
+        st["last_params"] = params
+        return params
+
+    def should_continue(self, task: TaskInfo, feedback: TaskSubmitFeedback) -> bool:
+        st = self._state_for(task.task_id)
+
+        cur_profit = feedback.net_profit_usd_day
+        if cur_profit is not None:
+            best_profit = st["best_profit"]
+            if best_profit is None or float(cur_profit) > float(best_profit):
+                st["best_profit"] = float(cur_profit)
+                st["best_params"] = st["last_params"]
+
+        if not feedback.can_continue or feedback.remaining_queries <= 0:
+            self._task_state.pop(task.task_id, None)
+            return False
+
+        if int(st["next_idx"]) < len(self._CANDIDATES):
+            return True
+
+        if isinstance(st["best_params"], OptimizationParams) and st["last_params"] != st["best_params"]:
+            st["replay_best_once"] = True
+            return True
+
+        self._task_state.pop(task.task_id, None)
+        return False
 
 
 def _load_wallet(coldkey: str, hotkey: str) -> Wallet:
@@ -179,10 +237,10 @@ def main(argv: Optional[list[str]] = None) -> int:
         "--min-validator-stake",
         dest="blacklist_validator_min_stake",
         type=float,
-        default=_env_float("BLACKLIST_VALIDATOR_MIN_STAKE", "MIN_VALIDATOR_STAKE", default=0.0),
+        default=_env_float("BLACKLIST_VALIDATOR_MIN_STAKE", "MIN_VALIDATOR_STAKE", default=-1.0),
         help=(
-            "Skip validators with metagraph S[uid] <= this (same rule as mode-network/synth-subnet "
-            "`--blacklist.validator_min_stake`). Default 0."
+            "Skip validators with metagraph S[uid] <= this (synth-subnet rule). "
+            "Default -1 disables the filter (needed for zero-stake local dev). Use 0 on mainnet."
         ),
     )
     parser.add_argument(
@@ -191,8 +249,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         type=_str2bool,
         default=_env_bool("BLACKLIST_FORCE_VALIDATOR_PERMIT", default=True),
         help=(
-            "If true, only UIDs with validator_permit (synth-subnet `--blacklist.force_validator_permit`). "
-            "Default true."
+            "If true, only UIDs with validator_permit. Default true; on local dev set false if discovery finds nothing."
         ),
     )
     parser.add_argument(
@@ -295,9 +352,21 @@ def main(argv: Optional[list[str]] = None) -> int:
                 logger.error("submit failed: %s %s", sr.status_code, sr.text)
                 return 1
             body = sr.json()
-            logger.info("smoke OK: state=%s overheated=%s", body.get("state"), body.get("overheated"))
-            if body.get("state") != "completed":
-                return 1
+            logger.info(
+                "smoke submit: state=%s q=%s rem=%s net_usd_day=%s can_continue=%s",
+                body.get("state"),
+                body.get("queries_used"),
+                body.get("remaining_queries"),
+                body.get("net_profit_usd_day"),
+                body.get("can_continue"),
+            )
+            if bool(body.get("can_continue")):
+                dr = client.decide_task(publication_id=pub, task_id=task.task_id, action="finalize")
+                if dr.status_code != 200:
+                    logger.error("decision failed: %s %s", dr.status_code, dr.text)
+                    return 1
+                db = dr.json()
+                logger.info("smoke decision: state=%s publication_completed=%s", db.get("state"), db.get("publication_completed"))
             return 0
 
         result = runner.run_publication(

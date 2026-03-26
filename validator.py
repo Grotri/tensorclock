@@ -2,6 +2,7 @@ import os
 import time
 import click
 import logging
+from urllib.parse import urlparse
 import bittensor as bt
 from bittensor_wallet import Wallet
 import threading
@@ -23,6 +24,7 @@ HEARTBEAT_TIMEOUT = 600  # seconds
 # Local imports
 from init_db import connect, init_db
 from publication_expiry import publication_expiry_sweep_loop
+from scoring_hashprice import blocking_fetch_initial_hashprice
 from task_manager import generate_miner_task_bundle
 from validator_api import app, init_validator_api
 from version import DB_SCHEMA_VERSION, TASK_CREATOR_VERSION
@@ -86,7 +88,7 @@ def _pick_winner_uid_from_completed(
           AND tasks_schema_version = ?
           AND miner_hotkey IS NOT NULL
           AND TRIM(miner_hotkey) <> ''
-        ORDER BY avg_net_profit DESC NULLS LAST, completed_at ASC
+        ORDER BY dollar_value DESC NULLS LAST, avg_net_profit DESC NULLS LAST, completed_at ASC
         LIMIT 64
         """,
         (tasks_creator_version, tasks_schema_version),
@@ -110,7 +112,7 @@ def _pick_winner_uid_from_completed(
         WHERE state='completed'
           AND miner_hotkey IS NOT NULL
           AND TRIM(miner_hotkey) <> ''
-        ORDER BY completed_at DESC NULLS LAST, avg_net_profit DESC NULLS LAST
+        ORDER BY dollar_value DESC NULLS LAST, avg_net_profit DESC NULLS LAST, completed_at DESC NULLS LAST
         LIMIT 64
         """,
     ).fetchall()
@@ -221,7 +223,30 @@ def heartbeat_monitor(last_heartbeat, stop_event):
     default=lambda: os.getenv("LOG_LEVEL", "INFO"),
     help="Logging level",
 )
-def main(network: str, netuid: int, coldkey: str, hotkey: str, log_level: str):
+@click.option(
+    "--api-port",
+    type=int,
+    default=None,
+    help="HTTP port for the validator API (default: VALIDATOR_API_PORT or 8090). Use another port for a second local validator.",
+)
+@click.option(
+    "--validator-api-url",
+    "validator_api_url",
+    default=None,
+    help=(
+        "Optional full base URL for documentation/testing; only the port is used for binding, "
+        "e.g. http://127.0.0.1:8091. Overrides --api-port and VALIDATOR_API_PORT when set."
+    ),
+)
+def main(
+    network: str,
+    netuid: int,
+    coldkey: str,
+    hotkey: str,
+    log_level: str,
+    api_port: Optional[int],
+    validator_api_url: Optional[str],
+):
     """Run the Chi subnet validator."""
     # Set log level
     logging.getLogger().setLevel(getattr(logging, log_level.upper()))
@@ -271,6 +296,9 @@ def main(network: str, netuid: int, coldkey: str, hotkey: str, log_level: str):
         if not db_url:
             raise RuntimeError("DATABASE_URL is required to run the validator with PostgreSQL.")
 
+        logger.info("Fetching initial hashprice (required for scoring); may retry on API errors…")
+        blocking_fetch_initial_hashprice(db_url)
+
         generator = VirtualDeviceGenerator()
         generator.load_builtin_specifications()
 
@@ -290,10 +318,20 @@ def main(network: str, netuid: int, coldkey: str, hotkey: str, log_level: str):
             "default 30s; batch cap PUBLICATION_EXPIRE_SWEEP_BATCH_LIMIT)"
         )
 
-        api_port = int(os.getenv("VALIDATOR_API_PORT", "8090"))
-        server = uvicorn.Server(uvicorn.Config(app, host="0.0.0.0", port=api_port, log_level="info"))
+        if validator_api_url:
+            parsed = urlparse(str(validator_api_url).strip())
+            if parsed.port is None:
+                raise RuntimeError(
+                    "--validator-api-url must include an explicit port, e.g. http://127.0.0.1:8091"
+                )
+            listen_port = int(parsed.port)
+        elif api_port is not None:
+            listen_port = int(api_port)
+        else:
+            listen_port = int(os.getenv("VALIDATOR_API_PORT", "8090"))
+        server = uvicorn.Server(uvicorn.Config(app, host="0.0.0.0", port=listen_port, log_level="info"))
         threading.Thread(target=server.run, daemon=True).start()
-        logger.info(f"Validator API started on :{api_port}")
+        logger.info("Validator API listening on 0.0.0.0:%s (e.g. http://127.0.0.1:%s)", listen_port, listen_port)
 
         # Hotkey-signed extrinsics cannot use MEV Shield (SDK warns + tx fails). Default off.
         mev_on = _env_bool("VALIDATOR_MEV_PROTECTION", default=False)

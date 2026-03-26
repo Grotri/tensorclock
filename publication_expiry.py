@@ -17,6 +17,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Mapping
 
 from init_db import connect
+from scoring_hashprice import recompute_leader_weights
 
 
 def publication_deadline_seconds() -> int:
@@ -78,7 +79,7 @@ def expire_publication(conn: Any, publication_id: str, now_iso: str) -> bool:
     cur = conn.execute(
         """
         UPDATE publications
-        SET state='expired', completed_at=?, avg_net_profit=0.0
+        SET state='expired', completed_at=?, avg_net_profit=0.0, dollar_value=0.0, weight=0
         WHERE publication_id=? AND state='active'
         """,
         (now_iso, publication_id),
@@ -94,11 +95,13 @@ def expire_publication(conn: Any, publication_id: str, now_iso: str) -> bool:
             failure_reason='publication_deadline',
             net_profit=0.0,
             best_efficiency=NULL,
-            completed_at=?
+            completed_at=?,
+            dollar_value=0.0
         WHERE publication_id=?
         """,
         (now_iso, publication_id),
     )
+    recompute_leader_weights(conn)
     return True
 
 
