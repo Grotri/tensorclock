@@ -259,7 +259,7 @@ def main(argv: Optional[list[str]] = None):
             stop_event.set()
             return
         tempo = int(tempo)
-        weight_interval = _weight_tick_interval_blocks(tempo)
+        epoch_interval_blocks = _weight_tick_interval_blocks(tempo)
 
         init_db()
         
@@ -360,13 +360,20 @@ def main(argv: Optional[list[str]] = None):
         last_weight_fail_time: float = 0.0
         last_weight_tick_block: Optional[int] = None
 
+        # If tx_period is explicitly configured, use it as local emission tick interval too.
+        # This allows multiple set_weights submissions inside one chain epoch.
+        weight_tick_interval = tx_period_i if tx_period_i is not None and tx_period_i > 0 else epoch_interval_blocks
+
         logger.info(
-            "set_weights: mev_protection=%s wait_for_finalization=%s fail_retry_cooldown=%.0fs tx_period=%s block_time=%s",
+            "set_weights: mev_protection=%s wait_for_finalization=%s fail_retry_cooldown=%.0fs "
+            "tx_period=%s block_time=%s epoch_interval=%s tick_interval=%s",
             mev_on,
             wait_fin,
             fail_cooldown_sec,
             tx_period_i if tx_period_i is not None else "default",
             weight_block_time,
+            epoch_interval_blocks,
+            weight_tick_interval,
         )
 
         # Main validator loop
@@ -374,7 +381,7 @@ def main(argv: Optional[list[str]] = None):
             try:
                 metagraph.sync(subtensor=subtensor)
                 current_block = subtensor.get_current_block()
-                interval = weight_interval
+                interval = weight_tick_interval
 
                 # Heartbeat: update the last heartbeat timestamp
                 last_heartbeat[0] = time.time()
