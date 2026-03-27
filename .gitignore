@@ -1,14 +1,9 @@
 __pycache__/
 output/
-virtual_devices/
-data/
-tasks.json
 .cursorrules
 .gitignore
-env.example
-.vscode/settings.json
+.vscode/
 .env
-docs/
 .cursorignore
 .cursor/
 knowledge/
