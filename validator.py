@@ -187,6 +187,85 @@ def _weight_tick_interval_blocks(tempo: int) -> int:
     return max(1, int(tempo))
 
 
+def _normalize_http_endpoint(raw: str) -> str:
+    value = str(raw or "").strip().rstrip("/")
+    if not value:
+        return ""
+    if not value.startswith("http://") and not value.startswith("https://"):
+        value = f"http://{value}"
+    return value
+
+
+def _resolve_commitment_url(
+    *,
+    validator_api_url: Optional[str],
+    listen_port: int,
+    cfg: dict[str, Any],
+) -> str:
+    # Priority:
+    # 1) explicit commitment URL, if provided
+    # 2) validator_api_url
+    # 3) local fallback from listen port
+    explicit = _normalize_http_endpoint(str(cfg_get(cfg, "validator.commitment_url", "")).strip())
+    if explicit:
+        return explicit
+    if validator_api_url:
+        norm = _normalize_http_endpoint(str(validator_api_url))
+        if norm:
+            return norm
+    return f"http://127.0.0.1:{int(listen_port)}"
+
+
+def ensure_validator_commitment(
+    *,
+    subtensor: Any,
+    wallet: Wallet,
+    metagraph: Any,
+    netuid: int,
+    commitment_url: str,
+    wait_for_finalization: bool = True,
+) -> None:
+    target = _normalize_http_endpoint(commitment_url)
+    if not target:
+        logger.warning("commitment: skipped (empty URL)")
+        return
+
+    my_hotkey = str(wallet.hotkey.ss58_address)
+    if my_hotkey not in getattr(metagraph, "hotkeys", []):
+        logger.warning("commitment: hotkey not in metagraph; skip")
+        return
+    uid = int(metagraph.hotkeys.index(my_hotkey))
+
+    current = None
+    try:
+        current = subtensor.get_commitment(netuid, uid)
+    except Exception as e:
+        logger.warning("commitment: get_commitment failed uid=%s netuid=%s: %s", uid, netuid, e)
+
+    current_norm = _normalize_http_endpoint(str(current)) if current is not None else ""
+    if current_norm == target:
+        logger.info("commitment: already set uid=%s url=%s", uid, target)
+        return
+
+    logger.info(
+        "commitment: setting uid=%s netuid=%s current=%r target=%s",
+        uid,
+        netuid,
+        current,
+        target,
+    )
+    resp = subtensor.set_commitment(
+        wallet,
+        netuid,
+        target,
+        wait_for_finalization=bool(wait_for_finalization),
+    )
+    if _extrinsic_succeeded(resp):
+        logger.info("commitment: set OK uid=%s url=%s detail=%s", uid, target, _extrinsic_detail(resp))
+    else:
+        logger.warning("commitment: set FAILED uid=%s url=%s detail=%s", uid, target, _extrinsic_detail(resp))
+
+
 def emit_incentive_weights(
     *,
     subtensor: Any,
@@ -368,6 +447,21 @@ def main(argv: Optional[list[str]] = None):
             listen_port = int(api_port)
         else:
             listen_port = int(cfg_get(cfg, "validator.api_port", 8090))
+
+        commitment_url = _resolve_commitment_url(
+            validator_api_url=validator_api_url,
+            listen_port=listen_port,
+            cfg=cfg,
+        )
+        ensure_validator_commitment(
+            subtensor=subtensor,
+            wallet=wallet,
+            metagraph=metagraph,
+            netuid=netuid,
+            commitment_url=commitment_url,
+            wait_for_finalization=True,
+        )
+
         server = uvicorn.Server(
             uvicorn.Config(
                 app,
