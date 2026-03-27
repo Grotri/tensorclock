@@ -102,20 +102,26 @@ def recompute_leader_weights(conn: Any) -> None:
     )
     conn.execute(
         """
+        WITH leaders AS (
+            SELECT DISTINCT ON (asic_model)
+                publication_id
+            FROM publications
+            WHERE state = 'completed'
+              AND tasks_creator_version = ?
+              AND tasks_schema_version = ?
+            ORDER BY
+                asic_model,
+                dollar_value DESC NULLS LAST,
+                avg_net_profit DESC NULLS LAST,
+                completed_at ASC
+        )
         UPDATE publications p
         SET weight = 1
-        WHERE p.state = 'completed'
+        FROM leaders l
+        WHERE p.publication_id = l.publication_id
+          AND p.state = 'completed'
           AND p.tasks_creator_version = ?
           AND p.tasks_schema_version = ?
-          AND p.publication_id = (
-              SELECT publication_id
-              FROM publications
-              WHERE state = 'completed'
-                AND tasks_creator_version = ?
-                AND tasks_schema_version = ?
-              ORDER BY dollar_value DESC NULLS LAST, avg_net_profit DESC NULLS LAST, completed_at ASC
-              LIMIT 1
-          )
         """,
         (
             TASK_CREATOR_VERSION,

@@ -152,6 +152,27 @@ def _extrinsic_detail(resp: Any) -> str:
         v = getattr(resp, name, None)
         if v not in (None, ""):
             return str(v)
+    err = getattr(resp, "error", None)
+    if err not in (None, ""):
+        return str(err)
+    data = getattr(resp, "data", None)
+    if data not in (None, ""):
+        return str(data)
+    receipt = getattr(resp, "extrinsic_receipt", None)
+    if receipt is not None:
+        # Common receipt details exposed by substrate clients.
+        for name in ("error_message", "error", "dispatch_error", "message"):
+            v = getattr(receipt, name, None)
+            if v not in (None, ""):
+                return f"{name}={v}"
+        try:
+            events = getattr(receipt, "triggered_events", None)
+            if events:
+                # Include the latest event as a fallback clue.
+                last = events[-1]
+                return f"receipt_event={last}"
+        except Exception:
+            pass
     return repr(resp)
 
 
@@ -369,6 +390,9 @@ def main(argv: Optional[list[str]] = None):
         # retry every loop (~12s) and spam the node. Cool down before retrying (time-based; works on fast blocks).
         fail_cooldown_sec = float(os.getenv("VALIDATOR_WEIGHT_FAIL_COOLDOWN_SEC", "120"))
         tx_period = os.getenv("VALIDATOR_TX_PERIOD_BLOCKS", "").strip()
+        if not tx_period:
+            # Preferred key written from TOML config.
+            tx_period = os.getenv("VALIDATOR_WEIGHT_TX_PERIOD_BLOCKS", "").strip()
         if tx_period.isdigit() and int(tx_period) > 0:
             tx_period_i = int(tx_period)
         else:
