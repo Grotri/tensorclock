@@ -8,7 +8,7 @@ from dotenv import load_dotenv
 load_dotenv()
 from typing import Any, Sequence
 
-from version import DB_SCHEMA_VERSION
+from utils.version import DB_SCHEMA_VERSION
 
 
 def _get_database_url() -> str:

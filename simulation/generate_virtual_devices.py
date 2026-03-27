@@ -1,6 +1,6 @@
-from init_db import init_db, connect, default_db_path
-from virtual_device_generator import VirtualDeviceGenerator
-from version import DEVICE_CREATOR_VERSION
+from utils.init_db import init_db, connect, default_db_path
+from simulation.virtual_device_generator import VirtualDeviceGenerator
+from utils.version import DEVICE_CREATOR_VERSION
 
 
 def generate_virtual_devices_from_templates(

@@ -13,8 +13,8 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from bittensor_wallet import Wallet  # noqa: E402
-from config_utils import cfg_get, load_toml_config  # noqa: E402
-from miner_template import (  # noqa: E402
+from utils.config_utils import cfg_get, load_toml_config  # noqa: E402
+from miner.miner_template import (  # noqa: E402
     MinerModel,
     MinerRunner,
     OptimizationParams,

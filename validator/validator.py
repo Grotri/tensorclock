@@ -15,14 +15,14 @@ logger = logging.getLogger(__name__)
 
 HEARTBEAT_TIMEOUT = 600
 
-from init_db import connect, init_db
-from publication_expiry import publication_expiry_sweep_loop
-from scoring_hashprice import blocking_fetch_initial_hashprice
-from task_manager import generate_miner_task_bundle
+from utils.init_db import connect, init_db
+from utils.publication_expiry import publication_expiry_sweep_loop
+from utils.scoring_hashprice import blocking_fetch_initial_hashprice
+from validator.task_manager import generate_miner_task_bundle
 from validator_api import app, init_validator_api
-from version import DB_SCHEMA_VERSION, TASK_CREATOR_VERSION
-from config_utils import cfg_get, load_toml_config
-from logging_utils import setup_logging, uvicorn_log_config
+from utils.version import DB_SCHEMA_VERSION, TASK_CREATOR_VERSION
+from utils.config_utils import cfg_get, load_toml_config
+from utils.logging_utils import setup_logging, uvicorn_log_config
 
 
 def _strip_cli_arg(argv: list[str], name: str) -> list[str]:
@@ -397,7 +397,7 @@ def main(argv: Optional[list[str]] = None):
 
         init_db()
         
-        from virtual_device_generator import VirtualDeviceGenerator
+        from simulation.virtual_device_generator import VirtualDeviceGenerator
         bootstrap_generator = VirtualDeviceGenerator()
         bootstrap_generator.load_builtin_specifications()
         supported_models = bootstrap_generator.get_available_models()

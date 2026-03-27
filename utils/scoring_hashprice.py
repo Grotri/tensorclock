@@ -7,10 +7,10 @@ import time
 from datetime import datetime, timezone
 from typing import Any, Optional
 
-from init_db import connect
-from hashprice_mempool import fetch_hashprice_quote
-from task_manager import EXPECTED_TASKS_PER_PUBLICATION
-from version import DB_SCHEMA_VERSION, TASK_CREATOR_VERSION
+from utils.init_db import connect
+from utils.hashprice_mempool import fetch_hashprice_quote
+from validator.task_manager import EXPECTED_TASKS_PER_PUBLICATION
+from utils.version import DB_SCHEMA_VERSION, TASK_CREATOR_VERSION
 
 logger = logging.getLogger(__name__)
 

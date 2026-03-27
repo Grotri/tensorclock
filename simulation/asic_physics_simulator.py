@@ -7,7 +7,7 @@ import warnings
 import hashlib
 from pathlib import Path
 
-from virtual_device_generator import (
+from simulation.virtual_device_generator import (
     VirtualDevice,
     HiddenParameters,
     HardwareLimits,
@@ -15,7 +15,7 @@ from virtual_device_generator import (
     VirtualDeviceGenerator
 )
 
-from init_db import init_db, connect, default_db_path
+from utils.init_db import init_db, connect, default_db_path
 
 
 class AmbientTemperatureLevel(Enum):

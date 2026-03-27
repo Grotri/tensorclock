@@ -4,8 +4,8 @@ import os
 from datetime import datetime, timedelta, timezone
 from typing import Any, Mapping
 
-from init_db import connect
-from scoring_hashprice import recompute_leader_weights
+from utils.init_db import connect
+from utils.scoring_hashprice import recompute_leader_weights
 
 
 def publication_deadline_seconds() -> int:

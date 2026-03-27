@@ -13,30 +13,30 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 from starlette.requests import Request
 
-from asic_physics_simulator import (
+from simulation.asic_physics_simulator import (
     ASICPhysicsSimulator,
     AmbientTemperatureLevel,
     OptimizationParameters,
 )
-from init_db import connect
-from publication_expiry import (
+from utils.init_db import connect
+from utils.publication_expiry import (
     deadline_iso_from_now,
     effective_publication_deadline,
     expire_publication_if_overdue,
 )
-from scoring_hashprice import (
+from utils.scoring_hashprice import (
     apply_scores_after_assignment_update,
     apply_scores_after_publication_completed,
     get_cached_usd_per_th_day,
     schedule_hashprice_refresh_if_stale,
 )
-from task_manager import (
+from validator.task_manager import (
     ELECTRICITY_PRICE_MAX,
     ELECTRICITY_PRICE_MIN,
     EXPECTED_TASKS_PER_PUBLICATION,
 )
-from version import DB_SCHEMA_VERSION, TASK_CREATOR_VERSION
-from virtual_device_generator import VirtualDeviceGenerator
+from utils.version import DB_SCHEMA_VERSION, TASK_CREATOR_VERSION
+from simulation.virtual_device_generator import VirtualDeviceGenerator
 
 logger = logging.getLogger(__name__)
 
@@ -54,7 +54,7 @@ async def _read_body_with_optional_epistula(request: Request) -> tuple[bytes, Op
     body = await request.body()
     if not _epistula_required():
         return body, None
-    from epistula import verify_epistula_request
+    from utils.epistula import verify_epistula_request
 
     try:
         hk = verify_epistula_request(headers=request.headers, body=body)

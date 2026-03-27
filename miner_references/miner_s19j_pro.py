@@ -13,8 +13,8 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from bittensor_wallet import Wallet  # noqa: E402
-from config_utils import cfg_get, load_toml_config  # noqa: E402
-from miner_template import (  # noqa: E402
+from utils.config_utils import cfg_get, load_toml_config  # noqa: E402
+from miner.miner_template import (  # noqa: E402
     MinerModel,
     MinerRunner,
     OptimizationParams,
@@ -42,12 +42,12 @@ def _str2bool(v: Union[str, bool]) -> bool:
     raise argparse.ArgumentTypeError(f"expected boolean string, got {v!r}")
 
 
-class MinerS19ProModel(MinerModel):
+class MinerS19jProModel(MinerModel):
     _CANDIDATES: tuple[OptimizationParams, ...] = (
-        OptimizationParams(frequency=580.0, voltage=12.9, fan_speed=90.0),
-        OptimizationParams(frequency=600.0, voltage=13.2, fan_speed=95.0),
-        OptimizationParams(frequency=620.0, voltage=13.3, fan_speed=100.0),
-        OptimizationParams(frequency=640.0, voltage=13.4, fan_speed=100.0),
+        OptimizationParams(frequency=580.0, voltage=12.7, fan_speed=90.0),
+        OptimizationParams(frequency=600.0, voltage=12.9, fan_speed=95.0),
+        OptimizationParams(frequency=620.0, voltage=13.0, fan_speed=100.0),
+        OptimizationParams(frequency=640.0, voltage=13.1, fan_speed=100.0),
     )
 
     def __init__(self) -> None:
@@ -138,7 +138,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     boot_args, _ = bootstrap.parse_known_args(argv)
     cfg = load_toml_config(boot_args.config)
 
-    parser = argparse.ArgumentParser(description="TensorClock S19 Pro miner")
+    parser = argparse.ArgumentParser(description="TensorClock S19j Pro miner")
     parser.add_argument("--config", default=boot_args.config)
     parser.add_argument("--log-level", default=str(cfg_get(cfg, "miner.log_level", "INFO")))
     parser.add_argument("--validator-url", default=str(cfg_get(cfg, "miner.validator_url", "")))
@@ -150,7 +150,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     parser.add_argument("--hotkey-name", default=str(cfg_get(cfg, "miner.hotkey_name", "default")))
     parser.add_argument("--no-wallet", action="store_true", default=bool(cfg_get(cfg, "miner.no_wallet", False)))
     parser.add_argument("--miner-uid", type=int, default=int(cfg_get(cfg, "miner.miner_uid", 0)))
-    parser.add_argument("--asic-model", default="Antminer S19 Pro")
+    parser.add_argument("--asic-model", default="Antminer S19j Pro")
     parser.add_argument("--target", default=str(cfg_get(cfg, "miner.target", "efficiency")))
     parser.add_argument("--smoke", action="store_true", default=bool(cfg_get(cfg, "miner.smoke", False)))
     args = parser.parse_args(argv)
@@ -176,7 +176,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     if args.smoke:
         urls = urls[:1]
 
-    model = MinerS19ProModel()
+    model = MinerS19jProModel()
     for idx, validator_url in enumerate(urls):
         logger.info("Validator %s/%s: %s", idx + 1, len(urls), validator_url)
         client = ValidatorClient(validator_url, wallet=wallet)
@@ -210,7 +210,7 @@ def main(argv: Optional[list[str]] = None) -> int:
                     return 1
             return 0
 
-        result = runner.run_publication(model, miner_uid=miner_uid, miner_hotkey=miner_hotkey_ss58, asic_model=args.asic_model, target=args.target, model_description_json={"model": "MinerS19ProModel", "version": "1.0"})
+        result = runner.run_publication(model, miner_uid=miner_uid, miner_hotkey=miner_hotkey_ss58, asic_model=args.asic_model, target=args.target, model_description_json={"model": "MinerS19jProModel", "version": "1.0"})
         logger.info("publication_id=%s tasks_attempted=%s completed=%s last_state=%s", result.publication_id, result.tasks_attempted, result.publication_completed, result.last_submit_state)
         if not result.publication_completed:
             logger.error("Publication did not complete for validator %s", validator_url)

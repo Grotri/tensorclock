@@ -4,7 +4,7 @@ import uuid
 from dataclasses import dataclass, asdict
 from typing import Any, Dict, List, Optional
 
-from version import DB_SCHEMA_VERSION, DEVICE_CREATOR_VERSION
+from utils.version import DB_SCHEMA_VERSION, DEVICE_CREATOR_VERSION
 
 @dataclass
 class HiddenParameters:

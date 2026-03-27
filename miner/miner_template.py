@@ -12,8 +12,8 @@ import requests
 
 from bittensor_wallet import Wallet
 
-from epistula import merge_headers, sign_epistula_request_body
-from logging_utils import setup_logging
+from utils.epistula import merge_headers, sign_epistula_request_body
+from utils.logging_utils import setup_logging
 
 logger = logging.getLogger(__name__)
 
