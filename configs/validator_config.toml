@@ -28,7 +28,7 @@ publication_expire_sweep_batch_limit = 100
 
 # Hashprice backend
 hashprice_ttl_sec = 18000
-mempool_api_base = "https://mempool.space/api/v1/mining/hashrate"
+mempool_api_base = "https://mempool.space/api/v1"
 
 # Weight emission behavior
 weight_mev_protection = false

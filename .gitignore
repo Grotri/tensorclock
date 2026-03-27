@@ -14,3 +14,8 @@ docs/
 knowledge/
 logs/
 agent_workflows/
+configs/miner1.toml
+configs/miner2.toml
+configs/miner3.toml
+configs/validator1.toml
+configs/validator2.toml

@@ -3,7 +3,6 @@ import time
 import argparse
 import logging
 from urllib.parse import urlparse
-import bittensor as bt
 from bittensor_wallet import Wallet
 import threading
 import sys
@@ -24,6 +23,26 @@ from validator_api import app, init_validator_api
 from version import DB_SCHEMA_VERSION, TASK_CREATOR_VERSION
 from config_utils import cfg_get, load_toml_config
 from logging_utils import setup_logging, uvicorn_log_config
+
+
+def _strip_cli_arg(argv: list[str], name: str) -> list[str]:
+    """
+    Remove all occurrences of '--name value' and '--name=value' from argv.
+    Used to prevent collisions with bittensor's internal argparse during import.
+    """
+    out: list[str] = []
+    i = 0
+    while i < len(argv):
+        token = str(argv[i])
+        if token == name:
+            i += 2
+            continue
+        if token.startswith(f"{name}="):
+            i += 1
+            continue
+        out.append(token)
+        i += 1
+    return out
 
 
 def _extrinsic_succeeded(resp: Any) -> bool:
@@ -207,8 +226,12 @@ def main(argv: Optional[list[str]] = None):
     api_port = int(args.api_port)
     validator_api_url = args.validator_api_url or None
 
+    db_url_cfg = str(cfg_get(cfg, "validator.database_url", "")).strip()
+    if not db_url_cfg:
+        raise RuntimeError("validator.database_url is required in config to run the validator.")
+
     env_pairs = {
-        "DATABASE_URL": str(cfg_get(cfg, "validator.database_url", "")).strip(),
+        "DATABASE_URL": db_url_cfg,
         "VALIDATOR_SIM_WORKERS": str(cfg_get(cfg, "validator.sim_workers", 4)),
         "VALIDATOR_API_PORT": str(cfg_get(cfg, "validator.api_port", 8090)),
         "EPISTULA_REQUIRED": "true" if bool(cfg_get(cfg, "validator.epistula_required", True)) else "false",
@@ -216,7 +239,7 @@ def main(argv: Optional[list[str]] = None):
         "PUBLICATION_EXPIRE_SWEEP_INTERVAL_SEC": str(cfg_get(cfg, "validator.publication_expire_sweep_interval_sec", 30)),
         "PUBLICATION_EXPIRE_SWEEP_BATCH_LIMIT": str(cfg_get(cfg, "validator.publication_expire_sweep_batch_limit", 100)),
         "HASHPRICE_TTL_SEC": str(cfg_get(cfg, "validator.hashprice_ttl_sec", 5 * 3600)),
-        "MEMPOOL_API_BASE": str(cfg_get(cfg, "validator.mempool_api_base", "https://mempool.space/api/v1/mining/hashrate")),
+        "MEMPOOL_API_BASE": str(cfg_get(cfg, "validator.mempool_api_base", "https://mempool.space/api/v1")),
         "VALIDATOR_MEV_PROTECTION": "true" if bool(cfg_get(cfg, "validator.weight_mev_protection", False)) else "false",
         "VALIDATOR_WAIT_FOR_FINALIZATION": "true"
         if bool(cfg_get(cfg, "validator.weight_wait_for_finalization", True))
@@ -231,6 +254,17 @@ def main(argv: Optional[list[str]] = None):
 
     # Set unified SDK-style logging (console + dated file + latest file).
     setup_logging(app_name="validator", level=log_level)
+
+    # bittensor parses process argv during import and treats --config as YAML path.
+    # Our app uses TOML config, so strip app-level --config before importing bittensor.
+    sys.argv = _strip_cli_arg(list(sys.argv), "--config")
+    import bittensor as bt
+    # bittensor import may reset root handlers/levels to defaults. Restore app logging afterwards.
+    setup_logging(app_name="validator", level=log_level)
+    # bittensor may also elevate existing logger levels (e.g. __main__) and hide INFO logs.
+    app_log_level = getattr(logging, str(log_level).upper(), logging.INFO)
+    logging.getLogger(__name__).setLevel(app_log_level)
+    logging.getLogger("__main__").setLevel(app_log_level)
     logger.info(f"Starting validator on network={network}, netuid={netuid}")
 
     last_heartbeat = [time.time()]
@@ -282,9 +316,7 @@ def main(argv: Optional[list[str]] = None):
                 len(bundle.tasks),
             )
 
-        db_url = str(cfg_get(cfg, "validator.database_url", "")).strip()
-        if not db_url:
-            raise RuntimeError("DATABASE_URL is required to run the validator with PostgreSQL.")
+        db_url = db_url_cfg
 
         logger.info("Fetching initial hashprice")
         blocking_fetch_initial_hashprice(db_url)

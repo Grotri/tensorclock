@@ -279,9 +279,11 @@ def generate_miner_task_bundle(
     devices_count: int = DEFAULT_BUNDLE_DEVICE_COUNT,
     query_budget: int = 10,
     target: OptimizationTarget = "efficiency",
-    db_path: Path | str = _default_db_path(),
+    db_path: Path | str | None = None,
     expires_in: timedelta = timedelta(hours=1),
 ) -> TaskBundle:
+    if db_path is None:
+        db_path = _default_db_path()
     init_db(str(db_path))
     generator = VirtualDeviceGenerator()
     generator.load_builtin_specifications()

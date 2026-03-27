@@ -3,11 +3,11 @@ from __future__ import annotations
 import abc
 import json
 import logging
+import sys
 from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any, Iterator, List, Optional, Sequence
 
-import bittensor as bt
 import requests
 
 from bittensor_wallet import Wallet
@@ -16,6 +16,33 @@ from epistula import merge_headers, sign_epistula_request_body
 from logging_utils import setup_logging
 
 logger = logging.getLogger(__name__)
+
+
+def _strip_cli_arg(argv: list[str], name: str) -> list[str]:
+    out: list[str] = []
+    i = 0
+    while i < len(argv):
+        token = str(argv[i])
+        if token == name:
+            i += 2
+            continue
+        if token.startswith(f"{name}="):
+            i += 1
+            continue
+        out.append(token)
+        i += 1
+    return out
+
+
+def safe_import_bittensor() -> Any:
+    # Prevent bittensor from trying to parse our TOML path passed as --config.
+    sys.argv = _strip_cli_arg(list(sys.argv), "--config")
+    import bittensor as bt
+    # bittensor may elevate __main__ logger level; restore it to root level.
+    app_level = logging.getLogger().level
+    logging.getLogger("__main__").setLevel(app_level)
+    logging.getLogger(__name__).setLevel(app_level)
+    return bt
 
 
 # ---------------------------------------------------------------------------
@@ -267,6 +294,7 @@ def discover_validator_endpoints(
     blacklist_force_validator_permit: bool = True,
     timeout_s: float = 10.0,
 ) -> list[str]:
+    bt = safe_import_bittensor()
     subtensor = bt.Subtensor(network=network)
     metagraph = bt.Metagraph(netuid=netuid, network=network)
     with _suppress_root_logging_temporarily():

@@ -23,6 +23,7 @@ from miner_template import (  # noqa: E402
     ValidatorClient,
     configure_logging,
     discover_validator_endpoints,
+    safe_import_bittensor,
     task_from_claim_task_dict,
     validate_optimization_params,
 )
@@ -102,7 +103,7 @@ def _effective_miner_uid_on_chain(network: str, netuid: int, cli_uid: int, walle
     if wallet is None:
         return int(cli_uid)
     try:
-        import bittensor as bt
+        bt = safe_import_bittensor()
     except ImportError:
         logger.warning("bittensor not installed; using --miner-uid=%s", cli_uid)
         return int(cli_uid)
