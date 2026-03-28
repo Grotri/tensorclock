@@ -4,6 +4,7 @@ import os
 from datetime import datetime, timedelta, timezone
 from typing import Any, Mapping
 
+from utils.db_row import row_to_plain_dict
 from utils.init_db import connect
 from utils.scoring_hashprice import recompute_leader_weights
 
@@ -98,7 +99,7 @@ def expire_publication_if_overdue(conn: Any, publication_id: str, now_iso: str) 
     ).fetchone()
     if row is None or row["state"] != "active":
         return False
-    deadline = effective_publication_deadline(row)
+    deadline = effective_publication_deadline(row_to_plain_dict(row))
     if not is_deadline_passed(deadline, now_iso):
         return False
     return expire_publication(conn, publication_id, now_iso)
@@ -119,9 +120,8 @@ def expire_stale_publications(db_url: str, *, now_iso: str | None = None, limit:
             """,
             (cap,),
         ).fetchall()
-        # Materialize before closing the connection: psycopg Row objects must not be
-        # used after the connection/cursor is closed (can raise TypeError on access).
-        rows = [dict(r) for r in raw_rows]
+        # Copy while connection is open; never use Row objects after the context exits.
+        rows = [row_to_plain_dict(r) for r in raw_rows]
 
     def _eff_deadline(row: Mapping[str, Any]) -> str:
         d = row.get("publication_deadline_at")
@@ -154,12 +154,12 @@ def publication_expiry_sweep_loop(db_url: str, stop_event: Any) -> None:
 
     logger = logging.getLogger(__name__)
     while not stop_event.is_set():
-        interval = sweep_interval_seconds()
-        if stop_event.wait(timeout=interval):
-            break
         try:
             n = expire_stale_publications(db_url)
             if n:
                 logger.info("Publication expiry sweep: expired %s publication(s)", n)
         except Exception:
             logger.exception("Publication expiry sweep failed")
+        interval = sweep_interval_seconds()
+        if stop_event.wait(timeout=interval):
+            break

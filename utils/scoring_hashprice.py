@@ -221,10 +221,11 @@ def schedule_hashprice_refresh_if_stale(db_url: str) -> None:
                 row = conn.execute(
                     "SELECT updated_at FROM hashprice_cache WHERE id=1",
                 ).fetchone()
-            if row is None:
-                stale = True
-            else:
-                stale = is_hashprice_stale(str(row["updated_at"]))
+                if row is None:
+                    stale = True
+                else:
+                    # Row must be read before connection closes (psycopg Row is invalid after).
+                    stale = is_hashprice_stale(str(row["updated_at"]))
             if not stale:
                 return
         except Exception:
