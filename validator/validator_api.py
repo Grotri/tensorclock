@@ -7,7 +7,7 @@ import threading
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Optional
+from typing import Any, Optional, cast
 
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
@@ -31,9 +31,13 @@ from utils.scoring_hashprice import (
     schedule_hashprice_refresh_if_stale,
 )
 from validator.task_manager import (
+    DEFAULT_BUNDLE_DEVICE_COUNT,
+    DEFAULT_TASK_EXPIRES_IN,
     ELECTRICITY_PRICE_MAX,
     ELECTRICITY_PRICE_MIN,
     EXPECTED_TASKS_PER_PUBLICATION,
+    OptimizationTarget,
+    ensure_task_pool_for_model,
 )
 from utils.version import DB_SCHEMA_VERSION, TASK_CREATOR_VERSION
 from simulation.virtual_device_generator import VirtualDeviceGenerator
@@ -124,6 +128,16 @@ class DecisionRequest(BaseModel):
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _normalize_claim_target(raw: str) -> str:
+    t = str(raw).strip().lower()
+    if t not in ("efficiency", "hashrate", "balanced"):
+        raise HTTPException(
+            status_code=422,
+            detail="target must be one of efficiency, hashrate, balanced",
+        )
+    return t
 
 
 @dataclass
@@ -243,8 +257,35 @@ async def claim_task(request: Request) -> ClaimResponse:
         )
     state = _get_state()
     now_iso = _now_iso()
+    new_publication_this_request = not (req.publication_id and str(req.publication_id).strip())
+    asic_stripped = str(req.asic_model).strip()
+    if not asic_stripped:
+        raise HTTPException(status_code=422, detail="asic_model must be non-empty")
+    claim_target_str = _normalize_claim_target(req.target)
+    claim_target: OptimizationTarget = cast(OptimizationTarget, claim_target_str)
+    available_models = state.generator.get_available_models()
+    if asic_stripped not in available_models:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Unknown asic_model={asic_stripped!r}. Available: {', '.join(available_models)}",
+        )
 
     try:
+        # Run in a separate connection: _ensure_tasks/_ensure_devices commit internally; if we mixed
+        # that with INSERT publication in one transaction, commits would persist the publication even
+        # when we later raise 404 and the outer block rolls back.
+        with connect(state.db_url) as conn:
+            with state.generator_lock:
+                ensure_task_pool_for_model(
+                    conn,
+                    state.generator,
+                    asic_model=asic_stripped,
+                    targets=(claim_target,),
+                    devices_count=DEFAULT_BUNDLE_DEVICE_COUNT,
+                    query_budget=10,
+                    expires_in=DEFAULT_TASK_EXPIRES_IN,
+                )
+
         with connect(state.db_url) as conn:
             pub_id = req.publication_id
             if not pub_id:
@@ -269,8 +310,8 @@ async def claim_task(request: Request) -> ClaimResponse:
                         pub_id,
                         req.miner_uid,
                         hk_claim,
-                        req.asic_model,
-                        req.target,
+                        asic_stripped,
+                        claim_target_str,
                         10,
                         TASK_CREATOR_VERSION,
                         DB_SCHEMA_VERSION,
@@ -367,11 +408,16 @@ async def claim_task(request: Request) -> ClaimResponse:
                 ORDER BY t.created_at ASC, t.task_id ASC
                 LIMIT 1
                 """,
-                (req.asic_model, req.target, TASK_CREATOR_VERSION, DB_SCHEMA_VERSION, now_iso, pub_id),
+                (asic_stripped, claim_target_str, TASK_CREATOR_VERSION, DB_SCHEMA_VERSION, now_iso, pub_id),
             ).fetchone()
 
             if task is None:
                 _try_finalize_publication_when_pool_exhausted(conn, pub_id, now_iso)
+                if new_publication_this_request:
+                    raise HTTPException(
+                        status_code=404,
+                        detail="No available tasks for this publication",
+                    )
                 conn.commit()
                 raise HTTPException(status_code=404, detail="No available tasks for this publication")
 

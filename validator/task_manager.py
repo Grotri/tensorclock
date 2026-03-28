@@ -7,7 +7,7 @@ import uuid
 from dataclasses import dataclass, asdict
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Literal, Optional, Tuple
+from typing import Any, Dict, List, Literal, Optional, Sequence, Tuple
 
 _ROOT = Path(__file__).resolve().parent.parent
 if str(_ROOT) not in sys.path:
@@ -23,6 +23,8 @@ EXPECTED_TASKS_PER_PUBLICATION = DEFAULT_BUNDLE_DEVICE_COUNT * len(AmbientTemper
 
 
 OptimizationTarget = Literal["efficiency", "hashrate", "balanced"]
+
+DEFAULT_TASK_EXPIRES_IN = timedelta(hours=1)
 
 ELECTRICITY_PRICE_MIN = 0.03
 ELECTRICITY_PRICE_MAX = 0.10
@@ -279,13 +281,29 @@ def _ensure_tasks(
     return tasks
 
 
+def ensure_task_pool_for_model(
+    conn: Any,
+    generator: VirtualDeviceGenerator,
+    *,
+    asic_model: str,
+    targets: Sequence[OptimizationTarget],
+    devices_count: int,
+    query_budget: int,
+    expires_in: timedelta,
+) -> None:
+    """Ensure devices exist and each target has open tasks for every (device × ambient)."""
+    devices = _ensure_devices(conn, generator, asic_model, devices_count)
+    for tgt in targets:
+        _ensure_tasks(conn, asic_model, devices, query_budget, tgt, expires_in)
+
+
 def generate_miner_task_bundle(
     asic_model: str = "Antminer S19",
     devices_count: int = DEFAULT_BUNDLE_DEVICE_COUNT,
     query_budget: int = 10,
     target: OptimizationTarget = "efficiency",
     db_path: Path | str | None = None,
-    expires_in: timedelta = timedelta(hours=1),
+    expires_in: timedelta = DEFAULT_TASK_EXPIRES_IN,
 ) -> TaskBundle:
     if db_path is None:
         db_path = _default_db_path()
