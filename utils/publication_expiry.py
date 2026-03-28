@@ -13,7 +13,10 @@ def publication_deadline_seconds() -> int:
 
 
 def sweep_interval_seconds() -> int:
-    return max(15, int(os.getenv("PUBLICATION_EXPIRE_SWEEP_INTERVAL_SEC", "30")))
+    raw = os.getenv("PUBLICATION_EXPIRE_SWEEP_INTERVAL_SEC", "30")
+    if raw is None or str(raw).strip() == "":
+        raw = "30"
+    return max(15, int(str(raw).strip()))
 
 
 def sweep_batch_limit() -> int:
@@ -107,7 +110,7 @@ def expire_stale_publications(db_url: str, *, now_iso: str | None = None, limit:
     cap = sweep_scan_cap()
 
     with connect(db_url) as conn:
-        rows = conn.execute(
+        raw_rows = conn.execute(
             """
             SELECT publication_id, publication_deadline_at, created_at
             FROM publications
@@ -116,6 +119,9 @@ def expire_stale_publications(db_url: str, *, now_iso: str | None = None, limit:
             """,
             (cap,),
         ).fetchall()
+        # Materialize before closing the connection: psycopg Row objects must not be
+        # used after the connection/cursor is closed (can raise TypeError on access).
+        rows = [dict(r) for r in raw_rows]
 
     def _eff_deadline(row: Mapping[str, Any]) -> str:
         d = row.get("publication_deadline_at")

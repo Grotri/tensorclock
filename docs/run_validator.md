@@ -50,7 +50,8 @@ Edit `configs/validator_config.toml` (or maintain a copy outside the repo and po
 - **`validator.network`** — e.g. `finney` or `test`.
 - **`validator.netuid`** — subnet UID.
 - **`validator.wallet_name` / `validator.hotkey_name`** — defaults `default`; must match your wallet.
-- **`validator.api_port`** — HTTP API port (default `8090`). The API listens on **`0.0.0.0`** on this port.
+- **`validator.api_port`** — HTTP API port (default `8090`).
+- **`validator.api_host`** — Bind address (default `0.0.0.0` = all interfaces, so miners can reach the API remotely). Override with env `VALIDATOR_API_HOST` if needed. Open the port in the host firewall and cloud security group.
 
 CLI flags override TOML when passed (e.g. `--network`, `--netuid`, `--coldkey`, `--hotkey`, `--api-port`).
 
@@ -87,7 +88,8 @@ Without the editable install, use `export PYTHONPATH="$(pwd)"` before the comman
 | `database_url is required` | Set `validator.database_url` in TOML. |
 | Init script cannot resolve DB URL | Set `validator.database_url` in `configs/validator_config.toml`, or export `DATABASE_URL`, or pass `--db`. |
 | `Hotkey ... is not registered` | Register the hotkey on the subnet or fix `--netuid` / wallet names. |
-| API unreachable | Confirm port, firewall. |
+| API unreachable from another machine | `validator.api_host` should be `0.0.0.0` (default); open `api_port` on the firewall and security group. |
+| Incomplete lines in `logs/validator/` | After this change, uvicorn/bittensor logs are merged into the same root file handlers; restart the validator. |
 | `No module named 'utils'` | Run `pip install -e .` from the repo root (see step 3), or `export PYTHONPATH="$(pwd)"`. |
 
 For dependency and Python version expectations, see `requirements.txt` at the repository root.

@@ -9,6 +9,24 @@ from typing import Any
 LOG_FORMAT = "%(asctime)s | %(levelname)s | %(message)s"
 LOG_DATEFMT = "%Y-%m-%d %H:%M:%S"
 
+_THIRD_PARTY_LOGGERS = (
+    "uvicorn",
+    "uvicorn.error",
+    "uvicorn.access",
+    "starlette",
+    "fastapi",
+    "bittensor",
+    "substrateinterface",
+)
+
+
+def reset_child_loggers_for_file_output() -> None:
+    """Clear handlers on common library loggers so records propagate to the root file handlers."""
+    for name in _THIRD_PARTY_LOGGERS:
+        lg = logging.getLogger(name)
+        lg.handlers.clear()
+        lg.propagate = True
+
 
 def setup_logging(*, app_name: str, level: str | int = "INFO", logs_root: str = "logs") -> None:
     level_value = getattr(logging, str(level).upper(), logging.INFO) if isinstance(level, str) else int(level)
@@ -41,6 +59,8 @@ def setup_logging(*, app_name: str, level: str | int = "INFO", logs_root: str = 
     f_latest.setLevel(level_value)
     f_latest.setFormatter(formatter)
     root.addHandler(f_latest)
+
+    reset_child_loggers_for_file_output()
 
 
 def uvicorn_log_config() -> dict[str, Any]:

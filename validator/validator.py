@@ -27,7 +27,7 @@ from validator.task_manager import generate_miner_task_bundle
 from validator.validator_api import app, init_validator_api
 from utils.version import DB_SCHEMA_VERSION, TASK_CREATOR_VERSION
 from utils.config_utils import cfg_get, load_toml_config
-from utils.logging_utils import setup_logging, uvicorn_log_config
+from utils.logging_utils import reset_child_loggers_for_file_output, setup_logging, uvicorn_log_config
 
 
 def _strip_cli_arg(argv: list[str], name: str) -> list[str]:
@@ -467,17 +467,27 @@ def main(argv: Optional[list[str]] = None):
             wait_for_finalization=True,
         )
 
+        api_host = os.getenv("VALIDATOR_API_HOST", "").strip()
+        if not api_host:
+            api_host = str(cfg_get(cfg, "validator.api_host", "0.0.0.0")).strip() or "0.0.0.0"
+
         server = uvicorn.Server(
             uvicorn.Config(
                 app,
-                host="0.0.0.0",
+                host=api_host,
                 port=listen_port,
                 log_level="info",
                 log_config=uvicorn_log_config(),
             )
         )
         threading.Thread(target=server.run, daemon=True).start()
-        logger.info("Validator API listening on 0.0.0.0:%s (e.g. http://127.0.0.1:%s)", listen_port, listen_port)
+        # Uvicorn may reconfigure logging handlers when the server starts; keep file logs complete.
+        reset_child_loggers_for_file_output()
+        logger.info(
+            "Validator API listening on http://%s:%s (bind all interfaces: use 0.0.0.0 for remote access)",
+            api_host,
+            listen_port,
+        )
 
         mev_on = _env_bool("VALIDATOR_MEV_PROTECTION", default=False)
         if mev_on:

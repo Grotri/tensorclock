@@ -7,6 +7,8 @@ log_level = "INFO"
 
 # API bind options: validator_api_url has priority; else api_port.
 validator_api_url = ""
+# Listen address: 0.0.0.0 = all interfaces (remote miners).
+api_host = "0.0.0.0"
 api_port = 8090
 
 # DB / runtime
