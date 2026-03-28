@@ -23,6 +23,7 @@ from miner.miner_template import (  # noqa: E402
     ValidatorClient,
     configure_logging,
     discover_validator_endpoints,
+    log_validator_http_error,
     safe_import_bittensor,
     task_from_claim_task_dict,
     validate_optimization_params,
@@ -186,8 +187,8 @@ def main(argv: Optional[list[str]] = None) -> int:
         runner = MinerRunner(client)
         if args.smoke:
             r = client.claim_task(miner_uid=miner_uid, miner_hotkey=miner_hotkey_ss58, asic_model=args.asic_model, target=args.target, publication_id=None)
+            log_validator_http_error("claim_task", r, success_codes=(200,))
             if r.status_code != 200:
-                logger.error("claim failed: %s %s", r.status_code, r.text)
                 return 1
             data = r.json()
             pub = data["publication_id"]
@@ -198,15 +199,15 @@ def main(argv: Optional[list[str]] = None) -> int:
                 logger.error("validation errors: %s", errs)
                 return 1
             sr = client.submit(publication_id=pub, task_id=task.task_id, params=params)
+            log_validator_http_error("submit_task", sr, success_codes=(200,))
             if sr.status_code != 200:
-                logger.error("submit failed: %s %s", sr.status_code, sr.text)
                 return 1
             body = sr.json()
             logger.info("smoke submit: state=%s q=%s rem=%s net_usd_day=%s can_continue=%s", body.get("state"), body.get("queries_used"), body.get("remaining_queries"), body.get("net_profit_usd_day"), body.get("can_continue"))
             if bool(body.get("can_continue")):
                 dr = client.decide_task(publication_id=pub, task_id=task.task_id, action="finalize")
+                log_validator_http_error("decide_task", dr, success_codes=(200,))
                 if dr.status_code != 200:
-                    logger.error("decision failed: %s %s", dr.status_code, dr.text)
                     return 1
             return 0
 

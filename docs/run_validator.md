@@ -63,7 +63,6 @@ Put the same URL in **`validator.database_url`** in `configs/validator_config.to
 
 ```bash
 cd /path/to/tensorclock
-conda activate tensorclock-validator
 python utils/init_db.py
 ```
 
@@ -75,8 +74,7 @@ Run from the **repository root** (after `pip install -e .`):
 
 ```bash
 cd /path/to/tensorclock
-conda activate tensorclock-validator
-python -m validator.validator --config configs/validator_config.toml
+python -m validator.validator
 ```
 
 Without the editable install, use `export PYTHONPATH="$(pwd)"` before the command.

@@ -23,6 +23,28 @@ from utils.logging_utils import setup_logging
 logger = logging.getLogger(__name__)
 
 
+def log_validator_http_error(
+    operation: str,
+    resp: requests.Response,
+    *,
+    success_codes: Optional[tuple[int, ...]] = None,
+) -> None:
+    """
+    Log response body for failed validator calls.
+
+    - Default: log only for HTTP >= 400 (typical client/server errors before ``raise_for_status``).
+    - If ``success_codes`` is set, log whenever ``status_code`` is not in that set (e.g. smoke tests
+      that expect exactly 200).
+    """
+    if success_codes is not None:
+        if resp.status_code in success_codes:
+            return
+        logger.error("%s failed: HTTP %s — %s", operation, resp.status_code, resp.text)
+        return
+    if resp.status_code >= 400:
+        logger.error("%s failed: HTTP %s — %s", operation, resp.status_code, resp.text)
+
+
 def _strip_cli_arg(argv: list[str], name: str) -> list[str]:
     out: list[str] = []
     i = 0
@@ -442,6 +464,7 @@ class MinerRunner:
                 if tasks_attempted > 0 and publication_id:
                     completed = True
                 break
+            log_validator_http_error("claim_task", r)
             r.raise_for_status()
             data = r.json()
             publication_id = data["publication_id"]
@@ -510,8 +533,7 @@ class MinerRunner:
                     logger.warning("Publication deadline expired (410 on decision); stopping run.")
                     completed = False
                     break
-                if dr.status_code >= 400:
-                    logger.error("decision failed: %s %s", dr.status_code, dr.text)
+                log_validator_http_error("decide_task", dr)
                 dr.raise_for_status()
                 dsub = dr.json()
                 last_state = str(dsub.get("state", last_state))
