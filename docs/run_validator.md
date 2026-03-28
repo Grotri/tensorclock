@@ -39,8 +39,6 @@ pip install -r requirements.txt
 pip install -e .
 ```
 
-The second line installs the repository as an **editable** package so imports such as `utils` resolve from any working directory (you do not need to set `PYTHONPATH` manually).
-
 ## 4. Configure the validator
 
 Edit `configs/validator_config.toml` (or maintain a copy outside the repo and point `--config` at it).
@@ -49,9 +47,6 @@ Edit `configs/validator_config.toml` (or maintain a copy outside the repo and po
 
 - **`validator.database_url`** — PostgreSQL URL, same format as `DATABASE_URL` (see above). If empty, the process exits with an error.
 - **`validator.validator_api_url`** — Full bind URL including port (e.g. `http://127.0.0.1:8091`). If set, it must include an explicit port.
-
-**Commonly adjusted**
-
 - **`validator.network`** — e.g. `finney` or `test`.
 - **`validator.netuid`** — subnet UID.
 - **`validator.wallet_name` / `validator.hotkey_name`** — defaults `default`; must match your wallet.
@@ -63,16 +58,13 @@ See `configs/validator_config.toml` for additional settings.
 
 ## 5. Initialize the database schema
 
-Set `DATABASE_URL` and run the initializer once (or after you intentionally reset the DB):
+Put the same URL in **`validator.database_url`** in `configs/validator_config.toml`, then run the initializer once (or after you intentionally reset the DB):
 
 ```bash
 cd /path/to/tensorclock
 conda activate tensorclock-validator
-export DATABASE_URL="postgresql://USER:PASSWORD@HOST:5432/DATABASE"
 python utils/init_db.py
 ```
-
-You can pass `--db` instead of `DATABASE_URL` if you prefer. If you skipped `pip install -e .`, set `export PYTHONPATH="$(pwd)"` before running scripts.
 
 The validator also calls `init_db()` on startup, but running the script first confirms connectivity and permissions.
 
@@ -93,7 +85,7 @@ Without the editable install, use `export PYTHONPATH="$(pwd)"` before the comman
 | Symptom | Check |
 |--------|--------|
 | `database_url is required` | Set `validator.database_url` in TOML. |
-| `DATABASE_URL is not set` (init script) | Export `DATABASE_URL` or pass `--db`. |
+| Init script cannot resolve DB URL | Set `validator.database_url` in `configs/validator_config.toml`, or export `DATABASE_URL`, or pass `--db`. |
 | `Hotkey ... is not registered` | Register the hotkey on the subnet or fix `--netuid` / wallet names. |
 | API unreachable | Confirm port, firewall. |
 | `No module named 'utils'` | Run `pip install -e .` from the repo root (see step 3), or `export PYTHONPATH="$(pwd)"`. |

@@ -14,17 +14,49 @@ from dotenv import load_dotenv
 load_dotenv()
 from typing import Any, Sequence
 
+from utils.config_utils import cfg_get, load_toml_config
 from utils.version import DB_SCHEMA_VERSION
+
+DEFAULT_VALIDATOR_CONFIG_PATH = _ROOT / "configs" / "validator_config.toml"
+
+
+def _database_url_from_validator_config(config_path: str | Path) -> str:
+    cfg = load_toml_config(str(config_path))
+    return str(cfg_get(cfg, "validator.database_url", "")).strip()
+
+
+def resolve_database_url(
+    *,
+    explicit: str | None = None,
+    config_path: str | Path | None = None,
+) -> str:
+    """
+    Resolve DB URL: explicit (--db) > DATABASE_URL > validator.database_url in TOML.
+    """
+    if explicit and str(explicit).strip():
+        return str(explicit).strip()
+    env = os.getenv("DATABASE_URL", "").strip()
+    if env:
+        return env
+    path = Path(config_path) if config_path is not None else DEFAULT_VALIDATOR_CONFIG_PATH
+    if not path.is_absolute():
+        path = _ROOT / path
+    if not path.is_file():
+        raise RuntimeError(
+            f"Database URL not set: DATABASE_URL is empty and config file not found: {path}\n"
+            "Set DATABASE_URL, pass --db, or create the config with validator.database_url."
+        )
+    url = _database_url_from_validator_config(path)
+    if not url:
+        raise RuntimeError(
+            f"validator.database_url is empty in {path}. "
+            "Set it to a PostgreSQL URL or use DATABASE_URL / --db."
+        )
+    return url
 
 
 def _get_database_url() -> str:
-    url = os.getenv("DATABASE_URL", "").strip()
-    if not url:
-        raise RuntimeError(
-            "DATABASE_URL is not set. Set it to a PostgreSQL connection URL, e.g.:\n"
-            "  export DATABASE_URL='postgresql://user:password@localhost:5432/tensorclock'"
-        )
-    return url
+    return resolve_database_url()
 
 
 def default_db_path() -> str:
@@ -79,11 +111,11 @@ class DBConnection:
 
 
 def connect(db_url: str | None = None) -> DBConnection:
-    url = (db_url or os.getenv("DATABASE_URL", "")).strip()
+    url = (db_url or resolve_database_url()).strip()
     if not url or not _is_postgres_url(url):
         raise RuntimeError(
             "A PostgreSQL URL is required (postgresql://...). "
-            "Set DATABASE_URL or pass --db postgresql://..."
+            "Set validator.database_url in configs/validator_config.toml, DATABASE_URL, or pass --db."
         )
     import psycopg
     from psycopg.rows import dict_row
@@ -335,13 +367,20 @@ def main() -> None:
         "--db",
         type=str,
         default=None,
-        help="PostgreSQL URL (default: use DATABASE_URL from env).",
+        help="PostgreSQL URL (overrides DATABASE_URL and validator.database_url in config).",
+    )
+    parser.add_argument(
+        "--config",
+        type=str,
+        default=str(DEFAULT_VALIDATOR_CONFIG_PATH),
+        help="Validator TOML to read validator.database_url when DATABASE_URL and --db are unset.",
     )
     args = parser.parse_args()
 
-    db_url = args.db or os.getenv("DATABASE_URL", "").strip()
-    if not db_url:
-        parser.error("DATABASE_URL is not set and --db was not given.")
+    try:
+        db_url = resolve_database_url(explicit=args.db, config_path=args.config)
+    except RuntimeError as e:
+        parser.error(str(e))
     if not _is_postgres_url(db_url):
         parser.error("Database URL must be postgresql://... or postgres://...")
 
