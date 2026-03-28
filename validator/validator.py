@@ -93,17 +93,25 @@ def _pick_winner_uid_from_completed_for_model(
     tasks_creator_version: str,
     tasks_schema_version: str,
 ) -> tuple[Optional[int], Optional[str]]:
+    """
+    Emission / set_weights only considers publications with zero failed assignments.
+    Any task failure (limits, overheating, etc.) disqualifies the run — unsafe zone.
+    """
     rows = conn.execute(
         """
-        SELECT miner_uid, miner_hotkey
-        FROM publications
-        WHERE state='completed'
-          AND asic_model = ?
-          AND tasks_creator_version = ?
-          AND tasks_schema_version = ?
-          AND miner_hotkey IS NOT NULL
-          AND TRIM(miner_hotkey) <> ''
-        ORDER BY dollar_value DESC NULLS LAST, avg_net_profit DESC NULLS LAST, completed_at ASC
+        SELECT p.miner_uid, p.miner_hotkey
+        FROM publications p
+        WHERE p.state='completed'
+          AND p.asic_model = ?
+          AND p.tasks_creator_version = ?
+          AND p.tasks_schema_version = ?
+          AND p.miner_hotkey IS NOT NULL
+          AND TRIM(p.miner_hotkey) <> ''
+          AND NOT EXISTS (
+            SELECT 1 FROM assignments a
+            WHERE a.publication_id = p.publication_id AND a.state = 'failed'
+          )
+        ORDER BY p.dollar_value DESC NULLS LAST, p.avg_net_profit DESC NULLS LAST, p.completed_at ASC
         LIMIT 64
         """,
         (asic_model, tasks_creator_version, tasks_schema_version),
@@ -122,13 +130,17 @@ def _pick_winner_uid_from_completed_for_model(
 
     rows_fb = conn.execute(
         """
-        SELECT miner_uid, miner_hotkey
-        FROM publications
-        WHERE state='completed'
-          AND asic_model = ?
-          AND miner_hotkey IS NOT NULL
-          AND TRIM(miner_hotkey) <> ''
-        ORDER BY dollar_value DESC NULLS LAST, avg_net_profit DESC NULLS LAST, completed_at DESC NULLS LAST
+        SELECT p.miner_uid, p.miner_hotkey
+        FROM publications p
+        WHERE p.state='completed'
+          AND p.asic_model = ?
+          AND p.miner_hotkey IS NOT NULL
+          AND TRIM(p.miner_hotkey) <> ''
+          AND NOT EXISTS (
+            SELECT 1 FROM assignments a
+            WHERE a.publication_id = p.publication_id AND a.state = 'failed'
+          )
+        ORDER BY p.dollar_value DESC NULLS LAST, p.avg_net_profit DESC NULLS LAST, p.completed_at DESC NULLS LAST
         LIMIT 64
         """,
         (asic_model,),

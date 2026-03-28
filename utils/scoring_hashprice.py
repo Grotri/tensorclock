@@ -90,6 +90,7 @@ def bulk_recompute_dollar_values_and_leader(conn: Any, usd_per_th_day: float) ->
 
 
 def recompute_leader_weights(conn: Any) -> None:
+    # Leaders: only publications with no failed assignments (unsafe / out-of-limits runs excluded).
     conn.execute(
         """
         UPDATE publications
@@ -103,17 +104,21 @@ def recompute_leader_weights(conn: Any) -> None:
     conn.execute(
         """
         WITH leaders AS (
-            SELECT DISTINCT ON (asic_model)
-                publication_id
-            FROM publications
-            WHERE state = 'completed'
-              AND tasks_creator_version = ?
-              AND tasks_schema_version = ?
+            SELECT DISTINCT ON (p.asic_model)
+                p.publication_id
+            FROM publications p
+            WHERE p.state = 'completed'
+              AND p.tasks_creator_version = ?
+              AND p.tasks_schema_version = ?
+              AND NOT EXISTS (
+                SELECT 1 FROM assignments a
+                WHERE a.publication_id = p.publication_id AND a.state = 'failed'
+              )
             ORDER BY
-                asic_model,
-                dollar_value DESC NULLS LAST,
-                avg_net_profit DESC NULLS LAST,
-                completed_at ASC
+                p.asic_model,
+                p.dollar_value DESC NULLS LAST,
+                p.avg_net_profit DESC NULLS LAST,
+                p.completed_at ASC
         )
         UPDATE publications p
         SET weight = 1
