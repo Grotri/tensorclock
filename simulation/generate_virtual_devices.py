@@ -1,3 +1,10 @@
+import sys
+from pathlib import Path
+
+_ROOT = Path(__file__).resolve().parent.parent
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
+
 from utils.init_db import init_db, connect, default_db_path
 from simulation.virtual_device_generator import VirtualDeviceGenerator
 from utils.version import DEVICE_CREATOR_VERSION

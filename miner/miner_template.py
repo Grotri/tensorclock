@@ -4,6 +4,11 @@ import abc
 import json
 import logging
 import sys
+from pathlib import Path
+
+_ROOT = Path(__file__).resolve().parent.parent
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
 from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any, Iterator, List, Optional, Sequence

@@ -2,11 +2,16 @@ from __future__ import annotations
 
 import json
 import random
+import sys
 import uuid
 from dataclasses import dataclass, asdict
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional, Tuple
+
+_ROOT = Path(__file__).resolve().parent.parent
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
 
 from utils.init_db import connect, default_db_path, init_db
 from simulation.virtual_device_generator import VirtualDeviceGenerator

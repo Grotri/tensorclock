@@ -14,3 +14,4 @@ configs/miner2.toml
 configs/miner3.toml
 configs/validator1.toml
 configs/validator2.toml
+tensorclock.egg-info/

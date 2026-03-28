@@ -1,0 +1,15 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tensorclock"
+version = "0.1.0"
+description = "TensorClock Bittensor subnet (validator, miner, simulation)"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = []
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["utils", "simulation", "validator", "miner", "miner_references"]

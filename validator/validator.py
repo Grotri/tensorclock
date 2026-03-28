@@ -1,11 +1,16 @@
 import os
+import sys
 import time
 import argparse
 import logging
+from pathlib import Path
 from urllib.parse import urlparse
 from bittensor_wallet import Wallet
 import threading
-import sys
+
+_ROOT = Path(__file__).resolve().parent.parent
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Optional
 
@@ -19,7 +24,7 @@ from utils.init_db import connect, init_db
 from utils.publication_expiry import publication_expiry_sweep_loop
 from utils.scoring_hashprice import blocking_fetch_initial_hashprice
 from validator.task_manager import generate_miner_task_bundle
-from validator_api import app, init_validator_api
+from validator.validator_api import app, init_validator_api
 from utils.version import DB_SCHEMA_VERSION, TASK_CREATOR_VERSION
 from utils.config_utils import cfg_get, load_toml_config
 from utils.logging_utils import setup_logging, uvicorn_log_config

@@ -1,4 +1,7 @@
 # Python 3.11+ recommended (stdlib tomllib in utils/config_utils.py)
+#
+# After installing deps, run from this directory: pip install -e .
+# so `utils`, `simulation`, `validator`, etc. import without PYTHONPATH.
 
 # Subtensor / chain
 bittensor>=10.1.0
