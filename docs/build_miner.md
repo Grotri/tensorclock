@@ -235,7 +235,7 @@ Exact on-chain ranking depends on subnet logic and the database; for development
 - The **`asic_model`** string must match **exactly** a name loaded by `VirtualDeviceGenerator` on the validator (built-in specs plus any extensions). Reference scripts use names such as `Antminer S19`, `Antminer S19 Pro`, `Antminer S19j Pro`.
 - An unknown name yields **422** with the list of available models.
 
-The **`target`** on claim must be one of the validator-supported values: **`efficiency`**, **`hashrate`**, **`balanced`**. The task pool is created for the `(asic_model, target)` pair you request.
+The **`target`** on claim must be one of the validator-supported values. Currently there is only efficiency parameter available.
 
 ---
 
