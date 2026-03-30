@@ -51,7 +51,6 @@ Edit `configs/validator_config.toml` (or maintain a copy outside the repo and po
 - **`validator.netuid`** — subnet UID.
 - **`validator.wallet_name` / `validator.hotkey_name`** — defaults `default`; must match your wallet.
 - **`validator.api_port`** — HTTP API port (default `8090`).
-- **`validator.api_host`** — Bind address (default `0.0.0.0` = all interfaces, so miners can reach the API remotely). Override with env `VALIDATOR_API_HOST` if needed. Open the port in the host firewall and cloud security group.
 
 CLI flags override TOML when passed (e.g. `--network`, `--netuid`, `--coldkey`, `--hotkey`, `--api-port`).
 
@@ -78,6 +77,7 @@ python -m validator.validator
 ```
 
 Without the editable install, use `export PYTHONPATH="$(pwd)"` before the command.
+There might be an error during first run of the validator. It is recommended to restart validator if you encountered an error during start up of the validator.
 
 ## 7. Troubleshooting
 
