@@ -1,0 +1,41 @@
+[validator]
+network = "finney"
+netuid = 1
+wallet_name = "default"
+hotkey_name = "default"
+log_level = "INFO"
+
+# API bind options: validator_api_url has priority; else api_port.
+validator_api_url = ""
+# Listen address: 0.0.0.0 = all interfaces (remote miners).
+api_host = "0.0.0.0"
+api_port = 8090
+
+# DB / runtime
+database_url = ""
+sim_workers = 4
+
+# Task bundle generation at startup
+bundle_devices_count = 5
+bundle_query_budget = 10
+bundle_target = "efficiency"
+
+# Validator API behavior
+epistula_required = true
+
+# Publication expiry and sweep
+publication_deadline_seconds = 600
+publication_expire_sweep_interval_sec = 30
+publication_expire_sweep_batch_limit = 100
+
+# Hashprice backend
+hashprice_ttl_sec = 18000
+mempool_api_base = "https://mempool.space/api/v1"
+
+# Weight emission behavior
+weight_mev_protection = false
+weight_wait_for_finalization = true
+weight_fail_cooldown_sec = 120
+weight_tx_period_blocks = 20
+weight_block_time_sec = 12.0
+

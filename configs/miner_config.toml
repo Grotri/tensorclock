@@ -1,0 +1,18 @@
+[miner]
+log_level = "INFO"
+network = "finney"
+netuid = 1
+validator_url = ""
+blacklist_validator_min_stake = -1.0
+blacklist_force_validator_permit = true
+
+wallet_name = "default"
+hotkey_name = "default"
+no_wallet = false
+miner_hotkey = ""
+miner_uid = 0
+
+asic_model = "Antminer S19"
+target = "efficiency"
+smoke = false
+

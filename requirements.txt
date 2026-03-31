@@ -1,0 +1,25 @@
+# Python 3.11+ recommended (stdlib tomllib in utils/config_utils.py)
+#
+# After installing deps, run from this directory: pip install -e .
+# so `utils`, `simulation`, `validator`, etc. import without PYTHONPATH.
+
+# Subtensor / chain
+bittensor>=10.1.0
+bittensor-wallet>=3.0.0
+
+# Database & env
+psycopg[binary]>=3
+python-dotenv>=1.0
+
+# Validator HTTP API (pydantic / starlette imported directly in validator_api)
+fastapi>=0.115.0
+uvicorn>=0.30.0
+pydantic>=2.0
+starlette>=0.37.0
+
+# HTTP client (miner template)
+requests>=2.31.0
+
+# Simulation (simulation/asic_physics_simulator.py)
+numpy>=1.24.0
+matplotlib>=3.7.0
