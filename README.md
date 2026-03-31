@@ -14,18 +14,14 @@ Industrial mining often runs **semi-static** profiles. Electricity prices, ambie
 
 ## How it works
 
-```text
-   MINER                              VALIDATOR
-     │                                    │
-     │  POST /task (claim)                │
-     │  POST /task/submit (f, V, fan)     │  ASICPhysicsSimulator
-     │  POST /task/decision (finalize)    │  PostgreSQL (tasks, publications)
-     ├───────────────────────────────────►│  Hashprice / scoring
-     │◄───────────────────────────────────┤
-     │  Task payloads, profit metrics     │
-     │                                    │
-     │  Epistula-signed JSON (default)    │
-     └────────────────────────────────────┘
+```mermaid
+flowchart LR
+    M[Miner] -->|POST /task claim<br/>POST /task/submit f, V, fan<br/>POST /task/decision finalize| V[Validator API]
+    V -->|Task payloads<br/>Assignment state<br/>Profit metrics| M
+    V --> S[ASICPhysicsSimulator]
+    V --> DB[(PostgreSQL<br/>tasks, publications)]
+    V --> H[Hashprice and scoring]
+    M -.->|Epistula-signed JSON by default| V
 ```
 
 1. Miners discover validator HTTP endpoints (on-chain commitments or a direct `--validator-url`).
